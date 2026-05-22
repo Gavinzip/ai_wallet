@@ -12,6 +12,7 @@ export type AgentChatResponse = {
 export async function sendAgentChat(
   messages: AgentMessage[],
   enabledSkills: AgentSkill[],
+  options: { walletAddress?: string | null } = {},
 ): Promise<AgentChatResponse> {
   const response = await fetch(`${getAgentApiBaseUrl("agent chat API")}/api/agent/chat`, {
     body: JSON.stringify({
@@ -26,6 +27,7 @@ export async function sendAgentChat(
           content: serializeAgentMessage(message),
           role: message.from === "agent" ? "assistant" : "user",
         })),
+      walletAddress: options.walletAddress ?? null,
     }),
     headers: {
       "Content-Type": "application/json",

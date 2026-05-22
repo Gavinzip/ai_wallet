@@ -186,6 +186,53 @@ export class WebTokenCoreWasmAdapter {
     return { signature: result.signature };
   }
 
+  async signPersonalMessage(input: { message: string }): Promise<{ signature: string }> {
+    const unlocked = await unlockStoredWebWallet();
+    const result = JSON.parse(
+      unlocked.tcx.sign_message(
+        JSON.stringify({
+          chain: "ETHEREUM",
+          derivationPath: WEB_DERIVATION_PATH,
+          input: {
+            message: input.message,
+            signatureType: "PersonalSign",
+          },
+          key: unlocked.prfKeyHex,
+          keystoreJson: unlocked.stored.keystoreJson,
+        }),
+      ),
+    ) as SignedMessageResult;
+    if (!result.signature) {
+      throw new Error("tcx-wasm did not return a message signature.");
+    }
+    return { signature: result.signature };
+  }
+
+  async signEthereumEcMessage(input: { messageHex: string }): Promise<{ signature: string }> {
+    if (!/^0x[0-9a-fA-F]+$/.test(input.messageHex)) {
+      throw new Error("EcSign message must be a hex payload.");
+    }
+    const unlocked = await unlockStoredWebWallet();
+    const result = JSON.parse(
+      unlocked.tcx.sign_message(
+        JSON.stringify({
+          chain: "ETHEREUM",
+          derivationPath: WEB_DERIVATION_PATH,
+          input: {
+            message: input.messageHex,
+            signatureType: "EcSign",
+          },
+          key: unlocked.prfKeyHex,
+          keystoreJson: unlocked.stored.keystoreJson,
+        }),
+      ),
+    ) as SignedMessageResult;
+    if (!result.signature) {
+      throw new Error("tcx-wasm did not return an EcSign signature.");
+    }
+    return { signature: result.signature };
+  }
+
   async buildTransferIntent(input: TransferIntentInput): Promise<{ txPayload: string }> {
     if (!input.evmTx) {
       throw new Error(

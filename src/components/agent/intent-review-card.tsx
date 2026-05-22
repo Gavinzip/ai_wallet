@@ -76,8 +76,21 @@ export function IntentReviewCard({
   const [status, setStatus] = useState<string | null>(null);
   const [walletPassword, setWalletPassword] = useState("");
   const [isSigning, setIsSigning] = useState(false);
+  const primaryAction = intent.actions[0];
+  const primaryActionName =
+    typeof primaryAction?.params?.action === "string" ? primaryAction.params.action : null;
+  const isBlockedIntent =
+    primaryActionName === "renaiss_buy_now_blocked" ||
+    primaryActionName === "renaiss_list_order_blocked" ||
+    intent.riskLevel === "block";
+  const confirmDisabled =
+    isSigning || isBlockedIntent || (signingMode === "password" && walletPassword.trim().length === 0);
 
   const requestSignature = async () => {
+    if (isBlockedIntent) {
+      setStatus("This intent is blocked by the safety checks above.");
+      return;
+    }
     const password = walletPassword.trim();
     if (signingMode === "password" && !password) {
       setStatus("Enter the local Token Core wallet password before signing.");
@@ -185,7 +198,7 @@ export function IntentReviewCard({
           <Pressable
             accessibilityLabel="Request local Token Core signing"
             accessibilityRole="button"
-            disabled={isSigning || (signingMode === "password" && walletPassword.trim().length === 0)}
+            disabled={confirmDisabled}
             onPress={() => {
               void requestSignature();
             }}
@@ -197,16 +210,12 @@ export function IntentReviewCard({
               gap: 9,
               justifyContent: "center",
               minHeight: 50,
-              opacity: isSigning || (signingMode === "password" && walletPassword.trim().length === 0) ? 0.65 : 1,
+              opacity: confirmDisabled ? 0.65 : 1,
             }}
           >
             <KeyRound color="#FFFFFF" size={18} strokeWidth={2.4} />
             <Text style={{ color: "#FFFFFF", fontSize: 16, fontWeight: "800" }}>
-              {signingMode === "passkey"
-                ? "Sign with Google + Passkey"
-                : intent.actions[0]?.type === "swap"
-                  ? "Sign & Submit On This Device"
-                  : "Sign On This Device"}
+              {getConfirmLabel(primaryAction?.type ?? null, primaryActionName, signingMode)}
             </Text>
           </Pressable>
         </>
@@ -231,4 +240,22 @@ export function IntentReviewCard({
       ) : null}
     </View>
   );
+}
+
+function getConfirmLabel(
+  actionType: WalletIntentAction["type"] | null,
+  actionName: string | null,
+  signingMode: "passkey" | "password",
+) {
+  if (actionName === "renaiss_session_login") return "Login to RENAISS";
+  if (actionName === "renaiss_fund_safe_bnb") return "Fund App Wallet Gas";
+  if (actionName === "renaiss_fund_safe_usdt") return "Fund App Wallet USDT";
+  if (actionName === "renaiss_usdt_approve_permit2") return "Approve USDT Permit2";
+  if (actionName === "renaiss_safe_usdt_approve_permit2") return "Approve Safe Permit2";
+  if (actionName === "renaiss_buy_now_sign_and_submit") return "Sign & Submit BuyNow";
+  if (actionName === "renaiss_list_order_sign_and_submit") return "Sign & Submit Listing";
+  if (actionName === "renaiss_buy_now_blocked") return "Blocked";
+  if (actionName === "renaiss_list_order_blocked") return "Blocked";
+  if (actionType === "swap") return "Sign & Submit On This Device";
+  return signingMode === "passkey" ? "Sign with Google + Passkey" : "Sign On This Device";
 }

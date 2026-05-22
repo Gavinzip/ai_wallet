@@ -20,6 +20,7 @@ import { BorderGlow } from "@/components/ui/border-glow";
 import { initialAgentMessages } from "@/data/agent";
 import { sendAgentChat } from "@/services/agent-chat";
 import { consumeBrowserExtensionSnapshotPrompt } from "@/services/extension/browser-extension-bridge";
+import { getTokenCoreWalletAdapter } from "@/services/token-core/token-core-wallet-adapter";
 import { useRenaissRecommendations } from "@/state/renaiss-recommendations-context";
 import { colors, radii } from "@/theme/tokens";
 import type { AgentMessage, AgentSkill } from "@/types/agent";
@@ -149,7 +150,12 @@ export function AgentChatPanel({
     setIsSending(true);
 
     try {
-      const response = await sendAgentChat(nextMessages, enabledSkills);
+      const wallet = tokenCoreReady
+        ? await getTokenCoreWalletAdapter().loadAgentIdentityWallet().catch(() => null)
+        : null;
+      const response = await sendAgentChat(nextMessages, enabledSkills, {
+        walletAddress: wallet?.address ?? null,
+      });
       setPendingIntent(response.intent);
       setMessages((current) => [
         ...current,

@@ -16,7 +16,7 @@ export type EvmTransactionPayload = {
 
 export type WalletIntentActionType = "sign_message" | "transfer" | "dapp_request" | "swap";
 
-export type WalletIntentActionParams = Record<string, boolean | number | string | null>;
+export type WalletIntentActionParams = Record<string, unknown>;
 
 export type WalletIntentAction = {
   type: WalletIntentActionType;

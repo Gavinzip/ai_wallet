@@ -156,7 +156,7 @@ function signTokenCoreMessage(tcxRuntime, wallet, message) {
   return signed.signature;
 }
 
-function createSiweMessage(input) {
+export function createSiweMessage(input) {
   const header = `${input.scheme}://${input.domain} wants you to sign in with your Ethereum account:`;
   return [
     header,
@@ -173,14 +173,14 @@ function createSiweMessage(input) {
   ].join("\n");
 }
 
-function readNonce(body) {
+export function readNonce(body) {
   if (body && typeof body === "object" && typeof body.nonce === "string" && body.nonce.length > 0) {
     return body.nonce;
   }
   throw new Error(`SIWE nonce response did not include nonce: ${safeJson(body)}`);
 }
 
-class RenaissAuthClient {
+export class RenaissAuthClient {
   #cookies = new Map();
 
   constructor(origin) {
@@ -261,7 +261,7 @@ function splitSetCookieHeader(value) {
   return value.split(/,(?=\s*[^;,]+=)/g).map((item) => item.trim()).filter(Boolean);
 }
 
-function summarizeSession(body) {
+export function summarizeSession(body) {
   if (!body || typeof body !== "object") {
     return { authenticated: false };
   }
@@ -299,6 +299,6 @@ function addressesEqual(first, second) {
   return typeof first === "string" && typeof second === "string" && first.toLowerCase() === second.toLowerCase();
 }
 
-function stripTrailingSlash(value) {
+export function stripTrailingSlash(value) {
   return value.replace(/\/+$/u, "");
 }

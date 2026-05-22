@@ -50,6 +50,8 @@ export type TokenCoreWalletAdapter = {
   createAgentIdentityWallet: (input?: { password?: string }) => Promise<TokenCoreAgentWallet>;
   loadAgentIdentityWallet: () => Promise<TokenCoreAgentWallet | null>;
   signLoginChallenge: (input: SignIntentInput) => Promise<{ signature: string }>;
+  signPersonalMessage: (input: { message: string; password?: string }) => Promise<{ signature: string }>;
+  signEthereumEcMessage: (input: { messageHex: string; password?: string }) => Promise<{ signature: string }>;
   buildTransferIntent: (input: TransferIntentInput) => Promise<{ txPayload: string }>;
 };
 
@@ -92,6 +94,14 @@ class UnavailableTokenCoreAdapter implements TokenCoreWalletAdapter {
   }
 
   async signLoginChallenge(_input: SignIntentInput): Promise<never> {
+    throw new Error(this.unavailableReason);
+  }
+
+  async signPersonalMessage(_input: { message: string; password?: string }): Promise<never> {
+    throw new Error(this.unavailableReason);
+  }
+
+  async signEthereumEcMessage(_input: { messageHex: string; password?: string }): Promise<never> {
     throw new Error(this.unavailableReason);
   }
 
@@ -141,6 +151,39 @@ class NativeTokenCoreBridgeAdapter implements TokenCoreWalletAdapter {
         keystoreId: wallet.id,
         messageHex,
         password: input.password,
+      }),
+    };
+  }
+
+  async signPersonalMessage(input: { message: string; password?: string }): Promise<{ signature: string }> {
+    if (!input.password) {
+      throw new Error("Token Core wallet password is required to sign this message.");
+    }
+    const wallet = await ensureAgentIdentityWallet(input.password);
+    return {
+      signature: await signTcxEthereumMessage(this.callRawTcxApi.bind(this), {
+        keystoreId: wallet.id,
+        messageHex: `0x${utf8ToHex(input.message)}`,
+        password: input.password,
+        signatureType: 0,
+      }),
+    };
+  }
+
+  async signEthereumEcMessage(input: { messageHex: string; password?: string }): Promise<{ signature: string }> {
+    if (!input.password) {
+      throw new Error("Token Core wallet password is required to sign this EVM digest preimage.");
+    }
+    if (!/^0x[0-9a-fA-F]+$/.test(input.messageHex)) {
+      throw new Error("EcSign message must be a hex payload.");
+    }
+    const wallet = await ensureAgentIdentityWallet(input.password);
+    return {
+      signature: await signTcxEthereumMessage(this.callRawTcxApi.bind(this), {
+        keystoreId: wallet.id,
+        messageHex: input.messageHex,
+        password: input.password,
+        signatureType: 1,
       }),
     };
   }

@@ -11,7 +11,23 @@ import {
   VAULTS_ADDRESSES,
 } from "@pufferfinance/puffer-sdk";
 
-import { createRenaissHeadlessSession } from "./renaiss-headless-auth.mjs";
+import {
+  createRenaissHeadlessSession,
+  createSiweMessage,
+  readNonce,
+  RenaissAuthClient,
+  summarizeSession,
+} from "./renaiss-headless-auth.mjs";
+import {
+  buildRenaissPurchasePlan,
+  RENAISS_PURCHASE_CHAIN_ID,
+  RENAISS_PURCHASE_ORIGIN,
+  submitRenaissBuyNow,
+} from "./renaiss-purchase.mjs";
+import {
+  buildRenaissListingPlan,
+  submitRenaissSellOffer,
+} from "./renaiss-listing.mjs";
 
 loadDotEnv();
 
@@ -44,6 +60,8 @@ const WEB_WALLET_BACKUP_DIR = process.env.WEB_WALLET_BACKUP_DIR ??
   path.join(process.cwd(), ".tmp", "web-wallet-backups");
 const renaissWebhookAlerts = [];
 let activeRenaissSession = null;
+const pendingRenaissSiweChallenges = new Map();
+const renaissSessionsByWallet = new Map();
 
 const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
@@ -138,8 +156,33 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
+  if (request.method === "POST" && requestUrl.pathname === "/api/renaiss/session/siwe/nonce") {
+    await handleRenaissSiweNonce(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/renaiss/session/siwe/verify") {
+    await handleRenaissSiweVerify(request, response);
+    return;
+  }
+
   if (request.method === "GET" && requestUrl.pathname === "/api/renaiss/session/current") {
     sendJson(response, 200, sanitizeRenaissSession(activeRenaissSession));
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/renaiss/purchase/prepare") {
+    await handleRenaissPurchasePrepare(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/renaiss/purchase/submit") {
+    await handleRenaissPurchaseSubmit(request, response);
+    return;
+  }
+
+  if (request.method === "POST" && requestUrl.pathname === "/api/renaiss/listing/submit") {
+    await handleRenaissListingSubmit(request, response);
     return;
   }
 
@@ -213,6 +256,7 @@ async function handleAgentChat(request, response) {
     const body = await readJson(request);
     const messages = validateMessages(body.messages);
     const enabledSkills = validateSkills(body.enabledSkills);
+    const walletAddress = normalizeOptionalEvmAddress(body.walletAddress);
     if (!messages.length) {
       sendJson(response, 400, {
         error: "At least one user message is required.",
@@ -242,11 +286,11 @@ async function handleAgentChat(request, response) {
       return;
     }
     if (hasRenaissSkill(enabledSkills) && isRenaissListingRequest(lastUserMessage)) {
-      await handleRenaissListingChat(lastUserMessage, response);
+      await handleRenaissListingChat(lastUserMessage, response, walletAddress);
       return;
     }
     if (hasRenaissSkill(enabledSkills) && isRenaissPurchaseRequest(lastUserMessage)) {
-      await handleRenaissPurchaseChat(messages, response);
+      await handleRenaissPurchaseChat(messages, response, walletAddress);
       return;
     }
     if (
@@ -254,7 +298,7 @@ async function handleAgentChat(request, response) {
       && isGenericPurchaseRequest(lastUserMessage)
       && findLatestRenaissPurchaseContext(messages)
     ) {
-      await handleRenaissPurchaseChat(messages, response);
+      await handleRenaissPurchaseChat(messages, response, walletAddress);
       return;
     }
     if (hasRenaissSkill(enabledSkills) && isRenaissRecommendationRequest(lastUserMessage)) {
@@ -502,11 +546,12 @@ async function handleRenaissAnalyze(request, response) {
       threshold_percent: nullableNumber(body.threshold_percent, -100, 100),
       wallet_budget_usd: nullableNumber(body.wallet_budget_usd, 0, 1_000_000),
     });
-    await proxyRenaissJson(response, "/v1/analyze/item-id", {
+    const payloadResponse = await fetchRenaissJson("/v1/analyze/item-id", {
       body: payload,
       method: "POST",
       timeoutMs: RENAISS_PROXY_TIMEOUT_MS,
     });
+    sendJson(response, 200, sanitizeRenaissAnalysisResponse(payloadResponse, payloadResponse?.result));
   } catch (error) {
     sendJson(response, 500, {
       error: error instanceof Error ? error.message : "RENAISS item analysis failed.",
@@ -626,47 +671,112 @@ async function handleRenaissChatRecommendation(userMessage, response) {
   }
 }
 
-async function handleRenaissListingChat(userMessage, response) {
+async function handleRenaissListingChat(userMessage, response, walletAddress) {
   const listing = extractRenaissListingDraft(userMessage);
   if (!listing.cardUrl && !listing.tokenId) {
     sendJson(response, 200, {
       intent: null,
       message: [
-        "可以，我可以先幫你準備 RENAISS 掛單審核。",
+        "可以，但我需要先知道是哪一張 RENAISS 卡。",
         "請貼 RENAISS 卡片連結或 tokenId，並告訴我掛單價格，例如：",
         "「幫我在 RENAISS 掛單 https://www.renaiss.xyz/... 價格 120 USDT」",
+        "掛單不是鏈上付款交易；它會簽 RENAISS 官方 Ask EIP-712 訂單，最後用目前 RENAISS session 送出 createSellOffer。",
       ].join("\n"),
-      model: "renaiss-order-review",
+      model: "renaiss-listing-live",
     });
     return;
   }
 
   if (listing.askPriceUsdt === null) {
     sendJson(response, 200, {
-      intent: createRenaissListingReviewIntent(listing),
+      intent: null,
       message: [
         "我已經抓到你要掛單的 RENAISS 卡片，但還缺掛單價格。",
         "請補一句價格，例如：「掛 120 USDT」。",
-        "我會先做掛單審核，不會替你送出掛單；真正送單要等 RENAISS 回傳官方 list/order typed-data 後，在本機 Token Core 確認簽名。",
+        "價格會當成你希望收到的 USDT；送到 RENAISS 的 ask amount 會再加上平台 fee，簽名前會列出 seller receive、fee、total ask。",
       ].join("\n"),
-      model: "renaiss-order-review",
+      model: "renaiss-listing-live",
     });
     return;
   }
 
-  sendJson(response, 200, {
-    intent: createRenaissListingReviewIntent(listing),
-    message: [
-      "我已經準備好 RENAISS 掛單審核。",
-      listing.cardUrl ? `卡片連結：${listing.cardUrl}` : `tokenId：${listing.tokenId}`,
-      `掛單價格：${listing.askPriceUsdt} USDT`,
-      "目前這是 review intent：我會幫你檢查卡片、價格、收款與簽名內容；真正掛單仍需要 RENAISS 官方 payload，最後由你在本機 Token Core/RENAISS 確認。",
-    ].join("\n"),
-    model: "renaiss-order-review",
-  });
+  if (!walletAddress) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        "可以掛單，但我需要先拿到目前 Token Core wallet address。",
+        "請先在 Wallet 頁建立或解鎖 Google + Passkey / Token Core 錢包，再回來說一次掛單指令。",
+        "我會確認 RENAISS session wallet 是否真的擁有這張卡；不會只看你貼的連結就送單。",
+      ].join("\n"),
+      model: "renaiss-listing-live",
+    });
+    return;
+  }
+
+  try {
+    const plan = await buildRenaissListingPlan({
+      listing,
+      session: getRenaissSessionForWallet(walletAddress),
+      walletAddress,
+    });
+    sendJson(response, 200, createRenaissListingChatResponse(listing, plan));
+  } catch (error) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        "我有收到掛單要求，但掛單準備失敗，所以沒有產生可簽名訂單。",
+        error instanceof Error ? error.message : "RENAISS listing prepare failed.",
+        "我不會用 review-only fallback 假裝已經能掛；要掛單前必須確認 session、卡片 owner、seller wallet 和 Ask typed-data。",
+      ].join("\n"),
+      model: "renaiss-listing-live",
+    });
+  }
 }
 
-async function handleRenaissPurchaseChat(messages, response) {
+function createRenaissListingChatResponse(listing, plan) {
+  if (plan.nextStep === "login") {
+    return {
+      intent: createRenaissListingSessionLoginIntent(listing, plan),
+      message: [
+        "可以掛單，先做第一步：用目前 Token Core wallet 登入 RENAISS。",
+        `卡片：${plan.cardUrl}`,
+        `你想收到：${plan.askPrice.sellerReceivesDisplay} USDT`,
+        "登入完成後再說一次掛單指令，我會確認這張卡是否屬於你的 RENAISS app wallet，然後產生官方 Ask EIP-712 簽名。",
+      ].join("\n"),
+      model: "renaiss-listing-live",
+    };
+  }
+
+  if (plan.nextStep === "sign_ask_and_submit") {
+    return {
+      intent: createRenaissListOrderIntent(listing, plan),
+      message: [
+        "前置條件已通過，可以準備真正掛單。",
+        `卡片：${plan.collectible?.name ?? plan.cardUrl}`,
+        `你想收到：${plan.askPrice.sellerReceivesDisplay} USDT`,
+        `平台 fee：${plan.orderbook.platformFeeBps} bps`,
+        `送到 RENAISS 的 total ask：${plan.askPrice.totalAskDisplay} USDT`,
+        `掛單錢包：${plan.sellerAddress}`,
+        plan.signatureMode === "safe_eip1271"
+          ? "按下面確認後，本機 Token Core 會簽 RENAISS Safe EIP-1271 Ask 訂單，然後伺服器用你的 RENAISS session 送出 offer.createSellOffer。"
+          : "按下面確認後，本機 Token Core 會簽 RENAISS 官方 Ask EIP-712 訂單，然後伺服器用你的 RENAISS session 送出 offer.createSellOffer。",
+      ].join("\n"),
+      model: "renaiss-listing-live",
+    };
+  }
+
+  return {
+    intent: createRenaissBlockedListingIntent(listing, plan),
+    message: [
+      "目前不能掛單，原因如下：",
+      ...plan.blockers.map((blocker) => `- ${blocker.message}`),
+      "我已經把原因放進審核卡，不會繞過 RENAISS owner 檢查或用伺服器代簽。",
+    ].join("\n"),
+    model: "renaiss-listing-live",
+  };
+}
+
+async function handleRenaissPurchaseChat(messages, response, walletAddress) {
   const context = findLatestRenaissPurchaseContext(messages);
 
   if (!context) {
@@ -675,27 +785,441 @@ async function handleRenaissPurchaseChat(messages, response) {
       message: [
         "可以，但我需要先知道是哪一張 RENAISS 卡。",
         "請先點一張推薦卡做分析，或直接貼 RENAISS 商品頁連結和價格。",
-        "拿到 item_id、商品頁、ask price 後，我會建立購買審核 intent；不會讓模型自己猜卡片或價格。",
+        "拿到 item_id、商品頁、ask price 後，我會建立真的購買流程；不會讓模型自己猜卡片或價格。",
       ].join("\n"),
-      model: "renaiss-purchase-review",
+      model: "renaiss-purchase-live",
     });
     return;
   }
 
-  sendJson(response, 200, {
-    intent: createRenaissPurchaseReviewIntent(context),
+  if (!walletAddress) {
+    sendJson(response, 200, {
+      intent: createRenaissSessionLoginIntent(context, null),
+      message: [
+        "可以買，但我需要先拿到目前 Token Core wallet address。",
+        "請先在 Wallet 頁建立或解鎖 Google + Passkey / Token Core 錢包，再回來說「幫我買這張」。",
+        "真正購買會分三步：RENAISS 登入、USDT Permit2 approve、EIP-712 buyNow 簽名送單。",
+      ].join("\n"),
+      model: "renaiss-purchase-live",
+    });
+    return;
+  }
+
+  try {
+    const plan = await buildRenaissPurchasePlan({
+      context,
+      session: getRenaissSessionForWallet(walletAddress),
+      walletAddress,
+    });
+    sendJson(response, 200, createRenaissPurchaseChatResponse(context, plan));
+  } catch (error) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        "我有找到卡片，但購買準備失敗，所以沒有產生可簽名交易。",
+        error instanceof Error ? error.message : "RENAISS purchase prepare failed.",
+        "我不會用 review-only fallback 假裝已經能買；要買之前必須拿到真實 session、餘額、allowance 和 typed-data。",
+      ].join("\n"),
+      model: "renaiss-purchase-live",
+    });
+  }
+}
+
+function createRenaissPurchaseChatResponse(context, plan) {
+  if (plan.nextStep === "login") {
+    return {
+      intent: createRenaissSessionLoginIntent(context, plan.signerAddress),
+      message: [
+        "可以，先做第一步：用目前 Token Core wallet 登入 RENAISS。",
+        `卡片：${context.name}`,
+        `價格：${plan.amountDisplay} USDT`,
+        "按下面確認後，我會在本機用 Token Core 簽 SIWE 登入訊息；伺服器只保存 RENAISS session cookie，不會拿到私鑰。",
+        "登入完成後再說一次「幫我買這張」，我會接著檢查 USDT、BNB gas 和 Permit2 allowance。",
+      ].join("\n"),
+      model: "renaiss-purchase-live",
+    };
+  }
+
+  if (plan.nextStep === "approve_permit2") {
+    return {
+      intent: createRenaissPermit2ApprovalIntent(context, plan),
+      message: [
+        "RENAISS session 已經有了，下一步需要先 approve USDT 給 Permit2。",
+        `卡片：${context.name}`,
+        `價格：${plan.amountDisplay} USDT`,
+        `USDT 餘額：${plan.balances.usdtDisplay} USDT`,
+        `目前 Permit2 allowance：${plan.permit2.allowanceDisplay} USDT`,
+        "按下面確認會送出一筆真的 BSC USDT approve 交易。Approve 成功後，再說一次「幫我買這張」才會進入 buyNow 簽名。",
+      ].join("\n"),
+      model: "renaiss-purchase-live",
+    };
+  }
+
+  if (plan.nextStep === "fund_safe_bnb") {
+    return {
+      intent: createRenaissFundSafeBnbIntent(context, plan),
+      message: [
+        "RENAISS 付款錢包需要先有一點 BNB buffer，我先幫你準備補 BNB。",
+        `卡片：${context.name}`,
+        `RENAISS 付款錢包目前：${plan.balances.bnbDisplay} BNB`,
+        `目標 buffer：${plan.funding.targetMinBnbDisplay} BNB`,
+        `需要從 Token Core owner 補：${plan.funding.amountDisplay} BNB`,
+        `Token Core owner 目前：${plan.funding.ownerBalances.bnbDisplay} BNB`,
+        "按下面確認會送出一筆真的 BSC BNB transfer 到 RENAISS app wallet。補 BNB 後，再說一次「幫我買這張」會接著補 USDT / approve / buyNow。",
+      ].join("\n"),
+      model: "renaiss-purchase-live",
+    };
+  }
+
+  if (plan.nextStep === "fund_safe_usdt") {
+    return {
+      intent: createRenaissFundSafeUsdtIntent(context, plan),
+      message: [
+        "RENAISS 付款錢包 USDT 不足，我先幫你準備補款。",
+        `卡片：${context.name}`,
+        `價格：${plan.amountDisplay} USDT`,
+        `RENAISS 付款錢包目前：${plan.balances.usdtDisplay} USDT`,
+        `需要從 Token Core owner 補：${plan.funding.amountDisplay} USDT`,
+        `Token Core owner 目前：${plan.funding.ownerBalances.usdtDisplay} USDT`,
+        "按下面確認會送出一筆真的 BSC USDT.transfer 到 RENAISS app wallet。補款成功後，再說一次「幫我買這張」會進入 approve / buyNow。",
+      ].join("\n"),
+      model: "renaiss-purchase-live",
+    };
+  }
+
+  if (plan.nextStep === "safe_approve_permit2") {
+    return {
+      intent: createRenaissSafePermit2ApprovalIntent(context, plan),
+      message: [
+        "RENAISS session 已經有了，下一步需要讓 RENAISS app wallet approve USDT 給 Permit2。",
+        `卡片：${context.name}`,
+        `價格：${plan.amountDisplay} USDT`,
+        `Token Core owner：${plan.signerAddress}`,
+        `RENAISS 付款錢包：${plan.payerAddress}`,
+        `USDT 餘額：${plan.balances.usdtDisplay} USDT`,
+        `目前 Permit2 allowance：${plan.permit2.allowanceDisplay} USDT`,
+        "按下面確認後，本機 Token Core 會簽 Safe/4337 使用者操作，由 RENAISS app wallet 送出 USDT.approve(Permit2)。",
+      ].join("\n"),
+      model: "renaiss-purchase-live",
+    };
+  }
+
+  if (plan.nextStep === "sign_bid_and_submit") {
+    return {
+      intent: createRenaissBuyNowIntent(context, plan),
+      message: [
+        "前置條件已通過，可以準備真正 buyNow。",
+        `卡片：${context.name}`,
+        `付款：${plan.amountDisplay} USDT`,
+        `RENAISS 付款錢包：${plan.session.walletAddress}`,
+        plan.signatureMode === "safe_eip1271"
+          ? "按下面確認後，本機 Token Core 會簽 RENAISS Safe EIP-1271 訊息，然後伺服器用你的 RENAISS session 送出 offer.buyNow。"
+          : "按下面確認後，本機 Token Core 會簽 RENAISS 官方 PermitWitnessTransferFrom EIP-712 payload，然後伺服器用你的 RENAISS session 送出 offer.buyNow。",
+      ].join("\n"),
+      model: "renaiss-purchase-live",
+    };
+  }
+
+  return {
+    intent: createRenaissBlockedPurchaseIntent(context, plan),
     message: [
-      "可以，我已經幫你準備 RENAISS 購買審核。",
-      `卡片：${context.name}`,
-      `目前 RENAISS ask：$${formatServerMoney(context.askPriceUsd)} USDT`,
-      context.estimatedProfitUsd === null
-        ? "預估損益：資料不足，需進一步核對來源。"
-        : `預估損益：${context.estimatedProfitUsd >= 0 ? "+" : "-"}$${formatServerMoney(Math.abs(context.estimatedProfitUsd))}`,
-      "下一步不是直接付款，而是先核對商品頁、價格、交易 payload、USDT/BNB 餘額和 Permit2/簽名內容。",
-      "等 RENAISS buyNow 官方 payload 接上後，最後仍要你在本機 Token Core 確認簽名。",
+      "目前不能直接買，原因如下：",
+      ...plan.blockers.map((blocker) => `- ${blocker.message}`),
+      "我已經把原因放進審核卡，不會用一般簽名或伺服器代簽繞過。",
     ].join("\n"),
-    model: "renaiss-purchase-review",
-  });
+    model: "renaiss-purchase-live",
+  };
+}
+
+function createRenaissSessionLoginIntent(context, walletAddress) {
+  return {
+    actions: [
+      {
+        amount: null,
+        chain: "BNB Smart Chain",
+        dappUrl: context.renaissUrl ?? "https://www.renaiss.xyz/marketplace",
+        data: null,
+        message: "Sign in to RENAISS with SIWE using this Token Core wallet.",
+        params: {
+          action: "renaiss_session_login",
+          cardName: context.name,
+          itemId: context.itemId,
+          walletAddress,
+        },
+        to: null,
+        token: null,
+        type: "dapp_request",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-login-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "info",
+    safetyChecks: [
+      "This only signs a RENAISS SIWE login message.",
+      "No USDT approval, payment, or buyNow request is sent in this step.",
+      "The private key stays in Token Core on this device.",
+    ],
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Login to RENAISS before buying ${context.name}.`,
+    title: "RENAISS Wallet Login",
+  };
+}
+
+function createRenaissPermit2ApprovalIntent(context, plan) {
+  return {
+    actions: [
+      {
+        amount: "unlimited",
+        chain: "BNB Smart Chain",
+        dappUrl: context.renaissUrl ?? "https://www.renaiss.xyz/marketplace",
+        data: plan.approveTx.data,
+        evmTx: plan.approveTx,
+        message: null,
+        params: {
+          action: "renaiss_usdt_approve_permit2",
+          approvalAmount: "MAX_UINT256",
+          contractAddress: plan.contracts.usdt,
+          spender: plan.contracts.permit2,
+          tokenAddress: plan.contracts.usdt,
+        },
+        to: plan.contracts.usdt,
+        token: "USDT",
+        type: "transfer",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-approve-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "danger",
+    safetyChecks: [
+      "This is a real BSC transaction: USDT.approve(Permit2, MAX_UINT256).",
+      "RENAISS official frontend uses this high allowance threshold; review the spender before signing.",
+      `USDT contract: ${plan.contracts.usdt}`,
+      `Permit2 spender: ${plan.contracts.permit2}`,
+      "After approve confirms on-chain, ask the agent to buy this card again.",
+    ],
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Approve RENAISS Permit2 USDT spend before buying ${context.name}.`,
+    title: "Approve RENAISS Permit2",
+  };
+}
+
+function createRenaissFundSafeBnbIntent(context, plan) {
+  return {
+    actions: [
+      {
+        amount: `${plan.funding.amountDisplay} BNB`,
+        chain: "BNB Smart Chain",
+        dappUrl: context.renaissUrl ?? "https://www.renaiss.xyz/marketplace",
+        data: "0x",
+        evmTx: plan.fundTx,
+        message: null,
+        params: {
+          action: "renaiss_fund_safe_bnb",
+          gasCostWei: plan.funding.gasCostWei,
+          ownerAddress: plan.signerAddress,
+          safeAddress: plan.payerAddress,
+          targetMinBnb: plan.funding.targetMinBnb,
+        },
+        to: plan.payerAddress,
+        token: "BNB",
+        type: "transfer",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-fund-safe-bnb-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "warning",
+    safetyChecks: [
+      "This is a real BSC native BNB transfer from the Token Core owner wallet.",
+      `Recipient RENAISS app wallet: ${plan.payerAddress}`,
+      `Transfer amount: ${plan.funding.amountDisplay} BNB`,
+      `Target app-wallet BNB buffer: ${plan.funding.targetMinBnbDisplay} BNB`,
+      `Estimated owner-wallet gas cost: ${plan.funding.gasCostWei} wei`,
+      "This only funds gas buffer; it does not approve USDT or submit buyNow.",
+    ],
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Fund RENAISS app wallet with ${plan.funding.amountDisplay} BNB gas buffer before buying ${context.name}.`,
+    title: "Fund RENAISS App Wallet Gas",
+  };
+}
+
+function createRenaissFundSafeUsdtIntent(context, plan) {
+  return {
+    actions: [
+      {
+        amount: `${plan.funding.amountDisplay} USDT`,
+        chain: "BNB Smart Chain",
+        dappUrl: context.renaissUrl ?? "https://www.renaiss.xyz/marketplace",
+        data: plan.fundTx.data,
+        evmTx: plan.fundTx,
+        message: null,
+        params: {
+          action: "renaiss_fund_safe_usdt",
+          gasCostWei: plan.funding.gasCostWei,
+          ownerAddress: plan.signerAddress,
+          safeAddress: plan.payerAddress,
+          tokenAddress: plan.contracts.usdt,
+        },
+        to: plan.payerAddress,
+        token: "USDT",
+        type: "transfer",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-fund-safe-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "warning",
+    safetyChecks: [
+      "This is a real BSC token transfer from the Token Core owner wallet.",
+      `Token: ${plan.contracts.usdt}`,
+      `Recipient RENAISS app wallet: ${plan.payerAddress}`,
+      `Transfer amount: ${plan.funding.amountDisplay} USDT`,
+      `Estimated owner-wallet gas cost: ${plan.funding.gasCostWei} wei`,
+      "The app wallet is still controlled by the same Token Core owner through RENAISS Safe/EIP-1271.",
+    ],
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Fund RENAISS app wallet with ${plan.funding.amountDisplay} USDT before buying ${context.name}.`,
+    title: "Fund RENAISS App Wallet",
+  };
+}
+
+function createRenaissSafePermit2ApprovalIntent(context, plan) {
+  return {
+    actions: [
+      {
+        amount: "unlimited",
+        chain: "BNB Smart Chain",
+        dappUrl: context.renaissUrl ?? "https://www.renaiss.xyz/marketplace",
+        data: plan.safeTx.calls[0]?.data ?? null,
+        message: null,
+        params: {
+          action: "renaiss_safe_usdt_approve_permit2",
+          approvalAmount: "MAX_UINT256",
+          calls: plan.safeTx.calls,
+          contractAddress: plan.contracts.usdt,
+          ownerAddress: plan.safeTx.ownerAddress,
+          safeAddress: plan.safeTx.safeAddress,
+          spender: plan.contracts.permit2,
+          tokenAddress: plan.contracts.usdt,
+        },
+        to: plan.contracts.usdt,
+        token: "USDT",
+        type: "dapp_request",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-safe-approve-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "danger",
+    safetyChecks: [
+      "This is a real Safe/4337 transaction: USDT.approve(Permit2, MAX_UINT256).",
+      "Token Core signs locally as the Safe owner; the RENAISS app wallet is the payer.",
+      `Safe/app wallet: ${plan.safeTx.safeAddress}`,
+      `Owner signer: ${plan.safeTx.ownerAddress}`,
+      `USDT contract: ${plan.contracts.usdt}`,
+      `Permit2 spender: ${plan.contracts.permit2}`,
+      "After approve confirms on-chain, ask the agent to buy this card again.",
+    ],
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Approve RENAISS Safe Permit2 USDT spend before buying ${context.name}.`,
+    title: "Approve RENAISS Safe Permit2",
+  };
+}
+
+function createRenaissBuyNowIntent(context, plan) {
+  return {
+    actions: [
+      {
+        amount: `${plan.amountDisplay} USDT`,
+        chain: "BNB Smart Chain",
+        dappUrl: context.renaissUrl ?? "https://www.renaiss.xyz/marketplace",
+        data: plan.bid.eip712Preimage,
+        message: JSON.stringify(plan.bid.typedData, null, 2),
+        params: {
+          action: "renaiss_buy_now_sign_and_submit",
+          bidData: plan.bid.bidData,
+          collectibleId: plan.collectibleId,
+          expectedDigest: plan.bid.eip712Digest,
+          itemId: context.itemId,
+          orderbookContract: plan.contracts.orderbook,
+          permit2Contract: plan.contracts.permit2,
+          safeAddress: plan.safe?.address ?? null,
+          signatureMode: plan.signatureMode,
+          tokenId: plan.tokenId.toString(),
+          typedData: plan.bid.typedData,
+          usdtContract: plan.contracts.usdt,
+        },
+        to: plan.contracts.orderbook,
+        token: "USDT",
+        type: "dapp_request",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-buynow-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "danger",
+    safetyChecks: [
+      plan.signatureMode === "safe_eip1271"
+        ? "This signs the RENAISS Safe EIP-1271 wrapper for the PermitWitnessTransferFrom payload shown above."
+        : "This signs the exact EIP-712 PermitWitnessTransferFrom payload shown above.",
+      "After local signature, the app submits RENAISS offer.buyNow with the current session cookie.",
+      `Spend amount: ${plan.amountDisplay} USDT`,
+      `Payer wallet: ${plan.payerAddress}`,
+      `Orderbook spender: ${plan.contracts.orderbook}`,
+      `Permit2 contract: ${plan.contracts.permit2}`,
+      `EIP-712 digest: ${plan.bid.eip712Digest}`,
+    ],
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Buy ${context.name} on RENAISS for ${plan.amountDisplay} USDT after local Token Core signature.`,
+    title: "RENAISS BuyNow",
+  };
+}
+
+function createRenaissBlockedPurchaseIntent(context, plan) {
+  return {
+    actions: [
+      {
+        amount: `${plan.amountDisplay ?? context.askPriceUsd} USDT`,
+        chain: "BNB Smart Chain",
+        dappUrl: context.renaissUrl ?? "https://www.renaiss.xyz/marketplace",
+        data: null,
+        message: null,
+        params: {
+          action: "renaiss_buy_now_blocked",
+          blockers: plan.blockers,
+          itemId: context.itemId,
+          session: plan.session ?? null,
+        },
+        to: null,
+        token: "USDT",
+        type: "dapp_request",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-blocked-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "block",
+    safetyChecks: plan.blockers.map((blocker) => blocker.message),
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Cannot safely buy ${context.name} until the blockers are resolved.`,
+    title: "RENAISS BuyNow Blocked",
+  };
 }
 
 async function handleBitrefillChat(userMessage, response) {
@@ -935,6 +1459,7 @@ async function createRenaissAiReview(input) {
   const opportunity = sanitizeRenaissOpportunity(rawOpportunity);
   const analysis = sanitizeRenaissOpportunity(rawAnalysis ?? rawOpportunity);
   const trendContext = buildRenaissTrendContext(rawAnalysis ?? rawOpportunity);
+  const deterministicFacts = buildDeterministicRenaissReviewFacts(analysis);
   if (!opportunity.item_id) {
     throw new Error("opportunity.item_id is required.");
   }
@@ -950,6 +1475,7 @@ async function createRenaissAiReview(input) {
             "所有輸出欄位都必須使用繁體中文，除非是卡名、來源名稱、幣別、網址或數字。",
             "只使用提供的 RENAISS monitor 事實、完整 normalized price-record 趨勢、卡名與來源資料。不要編造價格、流動性、稀有度、持有者或未提供的市場資訊。",
             "價格名詞必須精準：sources.*.avg_price_usd 只能叫「摘要參考均價」；trend.recent_avg_usd 只能叫「近期成交均價」；trend.latest_price_usd 只能叫「最新成交價」。不要使用「均價」單獨指代任何數字。",
+            "deterministicFacts 是系統已計算好的可信數字和結論；你的 verdict、priceSummary、trendSummary、reasons 不得和 deterministicFacts 矛盾。",
             "只要提到近期成交均價或最新成交價，必須寫出 trend.recent_start_date / trend.recent_end_date 或 latest_date 的時間區間；如果沒有日期就明確說日期不足。",
             "如果摘要參考均價與近期成交均價差很多，必須直接說這是全期/摘要均價與近期成交窗口不同造成，不可以讓它看起來像矛盾。",
             "只有 action 是 BUY_CANDIDATE 或利潤/價差清楚為正，且走勢沒有明顯反駁時，才可以給 buy_candidate。",
@@ -965,6 +1491,7 @@ async function createRenaissAiReview(input) {
         {
           content: JSON.stringify({
             analysis,
+            deterministicFacts,
             opportunity,
             priceContext: buildRenaissPriceContext(rawAnalysis ?? rawOpportunity),
             trendContext,
@@ -994,7 +1521,7 @@ async function createRenaissAiReview(input) {
     throw new Error("MiniMax response did not include RENAISS review content.");
   }
 
-  return normalizeRenaissAiReview(JSON.parse(extractFirstJsonObject(rawContent)), model);
+  return normalizeRenaissAiReview(JSON.parse(extractFirstJsonObject(rawContent)), model, deterministicFacts);
 }
 
 async function handleRenaissHeadlessLogin(response) {
@@ -1008,11 +1535,248 @@ async function handleRenaissHeadlessLogin(response) {
       origin: result.origin,
       session: result.session,
     };
+    storeRenaissSession(activeRenaissSession);
     sendJson(response, 200, sanitizeRenaissSession(activeRenaissSession));
   } catch (error) {
     sendJson(response, 502, {
       error: error instanceof Error ? error.message : "RENAISS headless login failed.",
     });
+  }
+}
+
+async function handleRenaissSiweNonce(request, response) {
+  try {
+    const body = await readJson(request);
+    const walletAddress = normalizeOptionalEvmAddress(body.walletAddress);
+    if (!walletAddress) {
+      sendJson(response, 400, { error: "walletAddress must be a full EVM address." });
+      return;
+    }
+
+    const origin = RENAISS_PURCHASE_ORIGIN;
+    const client = new RenaissAuthClient(origin);
+    const nonceResponse = await client.postJson("/api/auth/siwe/nonce", {
+      chainId: RENAISS_PURCHASE_CHAIN_ID,
+      walletAddress: walletAddress.toLowerCase(),
+    });
+    if (nonceResponse.status < 200 || nonceResponse.status >= 300) {
+      sendJson(response, 502, {
+        error: `RENAISS nonce request failed with HTTP ${nonceResponse.status}.`,
+        detail: nonceResponse.body,
+      });
+      return;
+    }
+
+    const nonce = readNonce(nonceResponse.body);
+    const issuedAt = new Date();
+    const expirationTime = new Date(Date.now() + 5 * 60 * 1000);
+    const message = createSiweMessage({
+      address: walletAddress,
+      chainId: RENAISS_PURCHASE_CHAIN_ID,
+      domain: new URL(origin).host,
+      expirationTime,
+      issuedAt,
+      nonce,
+      scheme: new URL(origin).protocol.replace(":", ""),
+      statement: "Sign in to Renaiss.",
+      uri: origin,
+      version: "1",
+    });
+    const challengeId = crypto.randomUUID();
+    pendingRenaissSiweChallenges.set(challengeId, {
+      client,
+      createdAt: Date.now(),
+      message,
+      walletAddress,
+    });
+    prunePendingRenaissSiweChallenges();
+
+    sendJson(response, 200, {
+      challengeId,
+      chainId: RENAISS_PURCHASE_CHAIN_ID,
+      expiresAt: expirationTime.toISOString(),
+      message,
+      walletAddress,
+    });
+  } catch (error) {
+    sendJson(response, 502, {
+      error: error instanceof Error ? error.message : "Could not create RENAISS SIWE challenge.",
+    });
+  }
+}
+
+async function handleRenaissSiweVerify(request, response) {
+  try {
+    const body = await readJson(request);
+    const challengeId = stringOrEmpty(body.challengeId);
+    const signature = stringOrEmpty(body.signature);
+    const challenge = pendingRenaissSiweChallenges.get(challengeId);
+    if (!challenge) {
+      sendJson(response, 400, { error: "RENAISS SIWE challenge expired or missing." });
+      return;
+    }
+    if (!/^0x[0-9a-fA-F]{130}$/.test(signature)) {
+      sendJson(response, 400, { error: "signature must be a 65-byte EVM signature." });
+      return;
+    }
+
+    const verifyResponse = await challenge.client.postJson("/api/auth/siwe/verify", {
+      chainId: RENAISS_PURCHASE_CHAIN_ID,
+      message: challenge.message,
+      signature,
+      walletAddress: challenge.walletAddress.toLowerCase(),
+    });
+    if (verifyResponse.status < 200 || verifyResponse.status >= 300) {
+      sendJson(response, 502, {
+        error: `RENAISS SIWE verify failed with HTTP ${verifyResponse.status}.`,
+        detail: verifyResponse.body,
+      });
+      return;
+    }
+
+    const sessionResponse = await challenge.client.getJson("/api/auth/get-session");
+    if (sessionResponse.status < 200 || sessionResponse.status >= 300) {
+      sendJson(response, 502, {
+        error: `RENAISS session check failed with HTTP ${sessionResponse.status}.`,
+        detail: sessionResponse.body,
+      });
+      return;
+    }
+
+    pendingRenaissSiweChallenges.delete(challengeId);
+    activeRenaissSession = {
+      cookieHeader: challenge.client.cookieHeader(),
+      cookieNames: challenge.client.cookieNames(),
+      createdAt: new Date().toISOString(),
+      id: crypto.randomUUID(),
+      origin: RENAISS_PURCHASE_ORIGIN,
+      session: {
+        ...summarizeSession(sessionResponse.body),
+        signedWalletAddress: challenge.walletAddress,
+        walletSource: "local-token-core-siwe",
+      },
+    };
+    activeRenaissSession.session.signedWalletLinked = addressesEqual(
+      activeRenaissSession.session.ownerWalletAddress,
+      challenge.walletAddress,
+    );
+    storeRenaissSession(activeRenaissSession);
+    sendJson(response, 200, sanitizeRenaissSession(activeRenaissSession));
+  } catch (error) {
+    sendJson(response, 502, {
+      error: error instanceof Error ? error.message : "Could not verify RENAISS SIWE login.",
+    });
+  }
+}
+
+async function handleRenaissPurchasePrepare(request, response) {
+  try {
+    const body = await readJson(request);
+    const context = sanitizeRenaissPurchaseContext(body.context);
+    const walletAddress = normalizeOptionalEvmAddress(body.walletAddress);
+    if (!context || !walletAddress) {
+      sendJson(response, 400, { error: "context and walletAddress are required." });
+      return;
+    }
+    const plan = await buildRenaissPurchasePlan({
+      context,
+      session: getRenaissSessionForWallet(walletAddress),
+      walletAddress,
+    });
+    sendJson(response, 200, plan);
+  } catch (error) {
+    sendJson(response, 502, {
+      error: error instanceof Error ? error.message : "RENAISS purchase prepare failed.",
+    });
+  }
+}
+
+async function handleRenaissPurchaseSubmit(request, response) {
+  try {
+    const body = await readJson(request);
+    const walletAddress = normalizeOptionalEvmAddress(body.walletAddress);
+    if (!walletAddress) {
+      sendJson(response, 400, { error: "walletAddress must be a full EVM address." });
+      return;
+    }
+    const session = getRenaissSessionForWallet(walletAddress);
+    if (!session?.cookieHeader) {
+      sendJson(response, 409, { error: "No RENAISS session for this wallet. Login first." });
+      return;
+    }
+    const result = await submitRenaissBuyNow({
+      bidData: body.bidData,
+      bidSignature: stringOrEmpty(body.bidSignature),
+      collectibleId: stringOrEmpty(body.collectibleId),
+      cookieHeader: session.cookieHeader,
+    });
+    sendJson(response, 200, {
+      result,
+      session: sanitizeRenaissSession(session),
+    });
+  } catch (error) {
+    sendJson(response, 502, {
+      error: error instanceof Error ? error.message : "RENAISS buyNow submit failed.",
+    });
+  }
+}
+
+async function handleRenaissListingSubmit(request, response) {
+  try {
+    const body = await readJson(request);
+    const walletAddress = normalizeOptionalEvmAddress(body.walletAddress);
+    if (!walletAddress) {
+      sendJson(response, 400, { error: "walletAddress must be a full EVM address." });
+      return;
+    }
+    const session = getRenaissSessionForWallet(walletAddress);
+    if (!session?.cookieHeader) {
+      sendJson(response, 409, { error: "No RENAISS session for this wallet. Login first." });
+      return;
+    }
+    const result = await submitRenaissSellOffer({
+      askData: body.askData,
+      askSignature: stringOrEmpty(body.askSignature),
+      collectibleId: stringOrEmpty(body.collectibleId),
+      cookieHeader: session.cookieHeader,
+    });
+    sendJson(response, 200, {
+      ok: true,
+      result,
+      session: sanitizeRenaissSession(session),
+    });
+  } catch (error) {
+    sendJson(response, 502, {
+      error: error instanceof Error ? error.message : "RENAISS createSellOffer submit failed.",
+    });
+  }
+}
+
+function storeRenaissSession(session) {
+  const addresses = [
+    session?.session?.ownerWalletAddress,
+    session?.session?.walletAddress,
+    session?.session?.signedWalletAddress,
+  ].filter((value) => typeof value === "string" && /^0x[a-fA-F0-9]{40}$/.test(value));
+  for (const address of addresses) {
+    renaissSessionsByWallet.set(address.toLowerCase(), session);
+  }
+}
+
+function getRenaissSessionForWallet(walletAddress) {
+  const normalized = normalizeOptionalEvmAddress(walletAddress);
+  if (!normalized) return null;
+  return renaissSessionsByWallet.get(normalized.toLowerCase()) ?? null;
+}
+
+function addressesEqual(first, second) {
+  return typeof first === "string" && typeof second === "string" && first.toLowerCase() === second.toLowerCase();
+}
+
+function prunePendingRenaissSiweChallenges() {
+  const cutoff = Date.now() - 10 * 60 * 1000;
+  for (const [id, challenge] of pendingRenaissSiweChallenges) {
+    if (challenge.createdAt < cutoff) pendingRenaissSiweChallenges.delete(id);
   }
 }
 
@@ -1579,25 +2343,69 @@ function createServerBscDappIntent(input) {
   };
 }
 
-function createRenaissListingReviewIntent(listing) {
-  const hasPrice = listing.askPriceUsdt !== null;
-  const subject = listing.cardUrl || (listing.tokenId ? `tokenId ${listing.tokenId}` : "RENAISS card");
+function createRenaissListingSessionLoginIntent(listing, plan) {
   return {
     actions: [
       {
-        amount: hasPrice ? String(listing.askPriceUsdt) : null,
+        amount: null,
         chain: "BNB Smart Chain",
         dappUrl: listing.cardUrl ?? "https://www.renaiss.xyz/marketplace",
         data: null,
-        message: null,
+        message: "Sign in to RENAISS with SIWE before creating a sell listing.",
         params: {
-          action: "renaiss_list_order_review",
-          askPriceUsdt: hasPrice ? String(listing.askPriceUsdt) : null,
+          action: "renaiss_session_login",
           cardUrl: listing.cardUrl,
-          reviewOnly: true,
+          listingPriceUsdt: plan.askPrice.sellerReceivesDisplay,
           tokenId: listing.tokenId,
+          walletAddress: plan.signerAddress,
         },
         to: null,
+        token: null,
+        type: "dapp_request",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-listing-login-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "info",
+    safetyChecks: [
+      "This only signs a RENAISS SIWE login message.",
+      "No listing is created in this step.",
+      "After login, the app will verify RENAISS ownerAddress before creating an Ask order.",
+    ],
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Login to RENAISS before listing ${listing.cardUrl ?? `tokenId ${listing.tokenId}`}.`,
+    title: "RENAISS Listing Login",
+  };
+}
+
+function createRenaissListOrderIntent(listing, plan) {
+  return {
+    actions: [
+      {
+        amount: `${plan.askPrice.totalAskDisplay} USDT`,
+        chain: "BNB Smart Chain",
+        dappUrl: listing.cardUrl ?? plan.cardUrl,
+        data: plan.ask.eip712Preimage,
+        message: JSON.stringify(plan.ask.typedData, null, 2),
+        params: {
+          action: "renaiss_list_order_sign_and_submit",
+          askData: plan.ask.askData,
+          collectibleId: plan.collectibleId,
+          collectibleName: plan.collectible?.name ?? null,
+          expectedDigest: plan.ask.eip712Digest,
+          orderbookContract: plan.contracts.orderbook,
+          ownerAddress: plan.sellerAddress,
+          safeAddress: plan.safe?.address ?? null,
+          sellerReceivesUsdt: plan.askPrice.sellerReceivesDisplay,
+          signatureMode: plan.signatureMode,
+          tokenId: plan.tokenId.toString(),
+          totalAskUsdt: plan.askPrice.totalAskDisplay,
+          typedData: plan.ask.typedData,
+        },
+        to: plan.contracts.orderbook,
         token: "USDT",
         type: "dapp_request",
       },
@@ -1606,20 +2414,56 @@ function createRenaissListingReviewIntent(listing) {
     id: `renaiss-listing-${Date.now()}`,
     requiresLocalSignature: true,
     requiresUserConfirmation: true,
-    riskLevel: hasPrice ? "warning" : "info",
+    riskLevel: "danger",
     safetyChecks: [
-      "Verify the RENAISS card page and tokenId before listing.",
-      "Verify ask price, currency, proceeds address, expiry, and fees before signing.",
-      "The official RENAISS list/order typed-data payload is not connected in this app yet.",
-      "Do not sign until RENAISS returns the exact order payload and Token Core decodes it on device.",
-      "Server and AI cannot list the card or sign the order.",
+      plan.signatureMode === "safe_eip1271"
+        ? "This signs the RENAISS Safe EIP-1271 wrapper for the Ask typed-data payload shown above."
+        : "This signs the exact RENAISS Ask EIP-712 payload shown above.",
+      "After local signature, the app submits RENAISS offer.createSellOffer with the current session cookie.",
+      `Seller receives target: ${plan.askPrice.sellerReceivesDisplay} USDT`,
+      `Total ask sent to RENAISS: ${plan.askPrice.totalAskDisplay} USDT`,
+      `Seller wallet: ${plan.sellerAddress}`,
+      `Collectible id: ${plan.collectibleId}`,
+      `Orderbook contract: ${plan.contracts.orderbook}`,
+      `EIP-712 digest: ${plan.ask.eip712Digest}`,
     ],
     serverCanExecute: false,
     status: "needs_review",
-    summary: hasPrice
-      ? `Review listing ${subject} at ${listing.askPriceUsdt} USDT on RENAISS.`
-      : `Review listing setup for ${subject}; ask price is still missing.`,
-    title: "RENAISS Listing Review",
+    summary: `List ${plan.collectible?.name ?? `tokenId ${plan.tokenId}`} on RENAISS for total ask ${plan.askPrice.totalAskDisplay} USDT.`,
+    title: "RENAISS Create Sell Offer",
+  };
+}
+
+function createRenaissBlockedListingIntent(listing, plan) {
+  return {
+    actions: [
+      {
+        amount: `${plan.askPrice?.totalAskDisplay ?? listing.askPriceUsdt} USDT`,
+        chain: "BNB Smart Chain",
+        dappUrl: listing.cardUrl ?? plan.cardUrl ?? "https://www.renaiss.xyz/marketplace",
+        data: null,
+        message: null,
+        params: {
+          action: "renaiss_list_order_blocked",
+          blockers: plan.blockers,
+          session: plan.session ?? null,
+          tokenId: plan.tokenId?.toString?.() ?? listing.tokenId,
+        },
+        to: null,
+        token: "USDT",
+        type: "dapp_request",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `renaiss-listing-blocked-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "block",
+    safetyChecks: plan.blockers.map((blocker) => blocker.message),
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Cannot safely list ${listing.cardUrl ?? `tokenId ${listing.tokenId}`} until the blockers are resolved.`,
+    title: "RENAISS Listing Blocked",
   };
 }
 
@@ -1964,7 +2808,11 @@ function sendJson(response, status, payload) {
     response.end();
     return;
   }
-  response.end(JSON.stringify(payload));
+  response.end(JSON.stringify(payload, jsonBigIntReplacer));
+}
+
+function jsonBigIntReplacer(_key, value) {
+  return typeof value === "bigint" ? value.toString() : value;
 }
 
 function serveStaticWeb(request, response, requestUrl) {
@@ -2032,7 +2880,7 @@ function getStaticSecurityHeaders(request) {
   ].join("; ");
   const headers = {
     "Content-Security-Policy": csp,
-    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Opener-Policy": "same-origin-allow-popups",
     "Cross-Origin-Resource-Policy": "same-origin",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
     "Referrer-Policy": "no-referrer",
@@ -2096,6 +2944,12 @@ function validateSkills(value) {
     })
     .filter((item) => item && item.name.length > 0)
     .slice(0, 12);
+}
+
+function normalizeOptionalEvmAddress(value) {
+  if (typeof value !== "string" || value.length === 0) return null;
+  const trimmed = value.trim();
+  return /^0x[a-fA-F0-9]{40}$/.test(trimmed) ? trimmed : null;
 }
 
 async function verifyGoogleBearerUser(request) {
@@ -3125,7 +3979,10 @@ function sanitizeRenaissSource(value, targetGrade = null) {
     };
   }
 
-  const trend = buildRenaissSourceTrend(value, targetGrade);
+  const hasNormalizedRecords = Array.isArray(value.records_normalized) && value.records_normalized.length > 0;
+  const trend = hasNormalizedRecords
+    ? buildRenaissSourceTrend(value, targetGrade)
+    : sanitizeProvidedRenaissTrend(value.trend, targetGrade) ?? buildRenaissSourceTrend(value, targetGrade);
   return {
     avg_price_usd: nullableNumber(value.avg_price_usd, 0, 10_000_000),
     diff_pct: nullableNumber(value.diff_pct, -10_000, 10_000),
@@ -3134,6 +3991,46 @@ function sanitizeRenaissSource(value, targetGrade = null) {
     sample_count: clampInteger(Number(value.sample_count ?? 0), 0, 1_000_000, 0),
     trend,
     url: nullableString(value.url),
+  };
+}
+
+function sanitizeProvidedRenaissTrend(value, targetGrade = null) {
+  if (!value || typeof value !== "object") return null;
+  const normalizedCount = clampInteger(Number(value.normalized_count ?? 0), 0, 1_000_000, 0);
+  const recentCount = clampInteger(Number(value.recent_count ?? 0), 0, 1_000_000, 0);
+  const recordsTotal = clampInteger(Number(value.records_total ?? normalizedCount), 0, 1_000_000, normalizedCount);
+  const direction = ["uptrend", "downtrend", "flat", "insufficient"].includes(value.direction)
+    ? value.direction
+    : "insufficient";
+  const compactRecords = Array.isArray(value.compact_records)
+    ? value.compact_records
+        .map((record) => ({
+          date_iso: nullableString(record?.date_iso),
+          grade: nullableString(record?.grade),
+          price_jpy: nullableNumber(record?.price_jpy, 0, 100_000_000),
+          price_usd: nullableNumber(record?.price_usd, 0, 10_000_000),
+          title: nullableString(record?.title),
+          url: nullableString(record?.url),
+        }))
+        .filter((record) => record.price_usd !== null || record.price_jpy !== null)
+        .slice(-80)
+    : [];
+  return {
+    compact_records: compactRecords,
+    direction,
+    earliest_date: nullableString(value.earliest_date),
+    grade_filter: nullableString(value.grade_filter ?? normalizeRenaissGrade(targetGrade)),
+    latest_date: nullableString(value.latest_date),
+    latest_price_usd: nullableNumber(value.latest_price_usd, 0, 10_000_000),
+    median_price_usd: nullableNumber(value.median_price_usd, 0, 10_000_000),
+    normalized_count: normalizedCount,
+    recent_avg_usd: nullableNumber(value.recent_avg_usd, 0, 10_000_000),
+    recent_count: recentCount,
+    recent_end_date: nullableString(value.recent_end_date),
+    recent_start_date: nullableString(value.recent_start_date),
+    records_total: recordsTotal,
+    trend_pct: nullableNumber(value.trend_pct, -10_000, 10_000),
+    used_grade_filter: Boolean(value.used_grade_filter),
   };
 }
 
@@ -3317,23 +4214,160 @@ function percentChange(base, next) {
   return ((next - base) / base) * 100;
 }
 
-function normalizeRenaissAiReview(value, model) {
+function buildDeterministicRenaissReviewFacts(item) {
+  const opportunity = sanitizeRenaissOpportunity(item);
+  const source = getBestRenaissSource(opportunity);
+  const ask = opportunity.ask_price_usd;
+  const summaryAvg = source?.avg_price_usd ?? null;
+  const trend = source?.trend ?? null;
+  const estimatedProfit = Number.isFinite(summaryAvg) && Number.isFinite(ask)
+    ? summaryAvg - ask
+    : opportunity.estimated_profit_usd;
+  const estimatedDiffPct = Number.isFinite(summaryAvg) && summaryAvg > 0 && Number.isFinite(estimatedProfit)
+    ? (estimatedProfit / summaryAvg) * 100
+    : opportunity.estimated_diff_pct;
+  const sourceLabel = source?.label ?? opportunity.best_market ?? "參考市場";
+  const priceSummary = Number.isFinite(ask) && Number.isFinite(summaryAvg)
+    ? [
+        `掛牌 $${formatServerMoney(ask)}`,
+        `${sourceLabel} 摘要參考均價 $${formatServerMoney(summaryAvg)}`,
+        Number.isFinite(estimatedProfit)
+          ? `預估損益 ${estimatedProfit >= 0 ? "+" : "-"}$${formatServerMoney(Math.abs(estimatedProfit))}`
+          : null,
+        Number.isFinite(estimatedDiffPct)
+          ? `價差 ${estimatedDiffPct.toFixed(1)}%`
+          : null,
+      ].filter(Boolean).join(" / ")
+    : "價格基準不足，不能只靠模型判斷。";
+  const trendSummary = formatDeterministicTrendSummary(sourceLabel, trend);
+  const reasons = [];
+  if (Number.isFinite(ask) && Number.isFinite(summaryAvg) && Number.isFinite(estimatedProfit)) {
+    reasons.push(
+      estimatedProfit >= 0
+        ? `掛牌低於${sourceLabel}摘要參考均價，預估 +$${formatServerMoney(estimatedProfit)}。`
+        : `掛牌高於${sourceLabel}摘要參考均價，預估 -$${formatServerMoney(Math.abs(estimatedProfit))}。`,
+    );
+  }
+  if (Number.isFinite(trend?.recent_avg_usd)) {
+    reasons.push(
+      `近期成交均價 $${formatServerMoney(trend.recent_avg_usd)}（${formatServerDateRange(trend.recent_start_date, trend.recent_end_date)}）。`,
+    );
+  }
+  if (Number.isFinite(trend?.latest_price_usd)) {
+    reasons.push(`最新成交 $${formatServerMoney(trend.latest_price_usd)}（${formatServerDate(trend.latest_date) || "日期不足"}）。`);
+  }
+
+  const riskFlags = [];
+  const priced = Array.isArray(trend?.compact_records)
+    ? trend.compact_records.map((record) => Number(record.price_usd)).filter(Number.isFinite)
+    : [];
+  if (priced.length >= 2) {
+    const min = Math.min(...priced);
+    const max = Math.max(...priced);
+    if (max > min * 3) {
+      riskFlags.push(`成交區間很寬 $${formatServerMoney(min)}-$${formatServerMoney(max)}，需核對異常成交。`);
+    }
+  }
+  const missingOtherSource = source?.key === "pricecharting"
+    ? !Number.isFinite(opportunity.sources?.snkrdunk?.avg_price_usd)
+    : !Number.isFinite(opportunity.sources?.pricecharting?.avg_price_usd);
+  if (missingOtherSource) {
+    riskFlags.push(`主要依賴${sourceLabel}，另一來源缺少可用摘要均價。`);
+  }
+
+  const verdict = deriveDeterministicRenaissVerdict(opportunity, source, estimatedProfit, estimatedDiffPct);
+  return {
+    minConfidence: verdict.minConfidence,
+    priceSummary,
+    reasons,
+    riskFlags,
+    trendSummary,
+    verdict: verdict.value,
+  };
+}
+
+function formatDeterministicTrendSummary(sourceLabel, trend) {
+  if (!trend || !Number.isFinite(trend.recent_avg_usd)) {
+    return `${sourceLabel} 近期成交資料不足；只能先用摘要參考均價做初篩。`;
+  }
+  const parts = [
+    `${sourceLabel} 近期成交均價 $${formatServerMoney(trend.recent_avg_usd)}（${formatServerDateRange(trend.recent_start_date, trend.recent_end_date)}，${trend.recent_count ?? 0} 筆）`,
+  ];
+  if (Number.isFinite(trend.latest_price_usd)) {
+    parts.push(`最新成交 $${formatServerMoney(trend.latest_price_usd)}（${formatServerDate(trend.latest_date) || "日期不足"}）`);
+  }
+  if (Number.isFinite(trend.trend_pct)) {
+    const direction = trend.direction === "uptrend" ? "走強" : trend.direction === "downtrend" ? "走弱" : "持平";
+    parts.push(`${direction} ${trend.trend_pct >= 0 ? "+" : ""}${trend.trend_pct.toFixed(1)}%`);
+  }
+  return `${parts.join(" / ")}。`;
+}
+
+function deriveDeterministicRenaissVerdict(opportunity, source, estimatedProfit, estimatedDiffPct) {
+  const direction = source?.trend?.direction;
+  const positive = Number.isFinite(estimatedProfit)
+    ? estimatedProfit > 0
+    : Number.isFinite(estimatedDiffPct) && estimatedDiffPct > 0;
+  if (positive && direction === "downtrend") {
+    return { minConfidence: 50, value: "watch" };
+  }
+  if (positive && (direction === "uptrend" || direction === "flat")) {
+    return { minConfidence: 72, value: "buy_candidate" };
+  }
+  if (positive && opportunity.action === "BUY_CANDIDATE") {
+    return { minConfidence: 62, value: "buy_candidate" };
+  }
+  if (!positive) {
+    return { minConfidence: 45, value: "avoid" };
+  }
+  return { minConfidence: 50, value: "watch" };
+}
+
+function formatServerDateRange(start, end) {
+  const startText = formatServerDate(start);
+  const endText = formatServerDate(end);
+  if (startText && endText) return `${startText}-${endText}`;
+  return startText || endText || "日期不足";
+}
+
+function formatServerDate(value) {
+  const date = stringOrEmpty(value).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(date) ? date.replaceAll("-", "/") : "";
+}
+
+function mergeReviewList(primary, secondary, limit) {
+  const values = [...(primary ?? []), ...(secondary ?? [])]
+    .map((item) => stringOrEmpty(item).trim())
+    .filter(Boolean);
+  return [...new Set(values)].slice(0, limit).map((item) => item.slice(0, 220));
+}
+
+function filterUnsafeGeneratedPriceClaims(values) {
+  return normalizeStringList(values, 5).filter((item) => !/[$％%]|均價|均价|價差|价差|低於|低于|高於|高于|預估|预估/.test(item));
+}
+
+function normalizeRenaissAiReview(value, model, deterministicFacts = null) {
   if (!value || typeof value !== "object") {
     throw new Error("MiniMax RENAISS review JSON must be an object.");
   }
 
+  const generatedReasons = filterUnsafeGeneratedPriceClaims(value.reasons);
+  const generatedRisks = filterUnsafeGeneratedPriceClaims(value.riskFlags);
+  const confidence = clampInteger(Number(value.confidence ?? 0), 0, 100, 0);
   return {
     cardNameSignals: normalizeStringList(value.cardNameSignals, 5),
-    confidence: clampInteger(Number(value.confidence ?? 0), 0, 100, 0),
+    confidence: deterministicFacts?.minConfidence
+      ? Math.max(confidence, deterministicFacts.minConfidence)
+      : confidence,
     headline: stringOrEmpty(value.headline).trim().slice(0, 220),
     marketDataUsed: normalizeStringList(value.marketDataUsed, 5),
     model,
     nextChecks: normalizeStringList(value.nextChecks, 5),
-    priceSummary: stringOrEmpty(value.priceSummary).trim().slice(0, 320),
-    reasons: normalizeStringList(value.reasons, 5),
-    riskFlags: normalizeStringList(value.riskFlags, 5),
-    trendSummary: stringOrEmpty(value.trendSummary).trim().slice(0, 360),
-    verdict: normalizeRenaissVerdict(value.verdict),
+    priceSummary: stringOrEmpty(deterministicFacts?.priceSummary ?? value.priceSummary).trim().slice(0, 320),
+    reasons: mergeReviewList(deterministicFacts?.reasons, generatedReasons, 5),
+    riskFlags: mergeReviewList(deterministicFacts?.riskFlags, generatedRisks, 5),
+    trendSummary: stringOrEmpty(deterministicFacts?.trendSummary ?? value.trendSummary).trim().slice(0, 360),
+    verdict: deterministicFacts?.verdict ?? normalizeRenaissVerdict(value.verdict),
   };
 }
 

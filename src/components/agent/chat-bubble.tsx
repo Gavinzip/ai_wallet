@@ -259,13 +259,27 @@ function InfoList({
 
 function PriceEvidenceBlock({ item }: { item: RenaissOpportunity }) {
   const rows = getPriceEvidenceRows(item);
-  if (rows.length === 0) return null;
+  const estimate = getEstimateFormula(item);
+  if (rows.length === 0 && !estimate) return null;
 
   return (
     <View style={{ gap: 8 }}>
       <Text style={{ color: colors.text, fontSize: 13, fontWeight: "900" }}>
         價格基準
       </Text>
+      {estimate ? (
+        <View
+          style={{
+            backgroundColor: estimate.tone === "positive" ? colors.mintSoft : colors.redSoft,
+            borderRadius: 16,
+            gap: 5,
+            padding: 10,
+          }}
+        >
+          <MetricText label="預估損益算法" value={estimate.formula} />
+          <MetricText label="價差算法" value={estimate.diffFormula} />
+        </View>
+      ) : null}
       <View style={{ gap: 7 }}>
         {rows.map((row) => (
           <View
@@ -413,6 +427,23 @@ function formatOpportunityEdge(item: RenaissAnalysisMessage["item"]) {
   const diff = item.estimated_diff_pct === null ? "無明確價差" : `${item.estimated_diff_pct.toFixed(1)}%`;
   const profit = item.estimated_profit_usd === null ? "" : ` / 預估 $${formatMoney(item.estimated_profit_usd)}`;
   return `${item.best_market ?? "無市場均價"} / ${diff}${profit}`;
+}
+
+function getEstimateFormula(item: RenaissAnalysisMessage["item"]) {
+  const source = getPreferredSource(item);
+  if (!source || !isFiniteNumber(source.avg_price_usd) || !isFiniteNumber(item.ask_price_usd)) {
+    return null;
+  }
+  const profit = source.avg_price_usd - item.ask_price_usd;
+  const diffPct = source.avg_price_usd === 0 ? null : (profit / source.avg_price_usd) * 100;
+  const sourceLabel = orderSourceKeys(item)[0] === "snkrdunk" ? "SNKRDUNK" : "PriceCharting";
+  return {
+    diffFormula: diffPct === null
+      ? "摘要參考均價為 0，無法計算百分比"
+      : `${profit >= 0 ? "+" : "-"}$${formatMoney(Math.abs(profit))} / $${formatMoney(source.avg_price_usd)} = ${diffPct.toFixed(1)}%`,
+    formula: `${sourceLabel} 摘要參考均價 $${formatMoney(source.avg_price_usd)} - 掛牌 $${formatMoney(item.ask_price_usd)} = ${profit >= 0 ? "+" : "-"}$${formatMoney(Math.abs(profit))}`,
+    tone: profit >= 0 ? "positive" as const : "negative" as const,
+  };
 }
 
 function formatDateRange(start?: string | null, end?: string | null) {

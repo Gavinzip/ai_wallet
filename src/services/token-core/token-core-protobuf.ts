@@ -113,7 +113,7 @@ export async function deriveTcxEvmAccount(
 
 export async function signTcxEthereumMessage(
   callRawTcxApi: (hexPayload: string) => Promise<string>,
-  input: { keystoreId: string; messageHex: string; password: string },
+  input: { keystoreId: string; messageHex: string; password: string; signatureType?: 0 | 1 },
 ) {
   const result = await callTcxApi(
     callRawTcxApi,
@@ -122,7 +122,7 @@ export async function signTcxEthereumMessage(
       chainType: EVM_CHAIN_TYPE,
       curve: EVM_CURVE,
       id: input.keystoreId,
-      input: encodeAny(encodeEthMessageInput({ message: input.messageHex, signatureType: 0 })),
+      input: encodeAny(encodeEthMessageInput({ message: input.messageHex, signatureType: input.signatureType ?? 0 })),
       network: "",
       password: input.password,
       path: DEFAULT_ETH_DERIVATION_PATH,
