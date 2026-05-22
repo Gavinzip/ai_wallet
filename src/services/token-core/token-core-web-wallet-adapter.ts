@@ -58,6 +58,8 @@ type SignedMessageResult = {
 const WEB_WALLET_CURRENT_SUB_KEY = "imtoken.webWallet.currentSub.v1";
 const WEB_WALLET_KEY_PREFIX = "imtoken.webWallet.v1";
 const WEB_DERIVATION_PATH = "m/44'/60'/0'/0/0";
+const TCX_WASM_MODULE_PATH = "/tcx_wasm.js";
+const TCX_WASM_BINARY_PATH = "/tcx_wasm_bg.wasm";
 
 let tcxWasmPromise: Promise<TcxWasmModule> | null = null;
 let lastWalletSyncNotice: string | null = null;
@@ -285,6 +287,70 @@ export async function restoreWebTokenCoreWalletBackup(rawJson: string): Promise<
   return restoreParsedWebTokenCoreWalletBackup(backup);
 }
 
+export async function importWebTokenCoreRecoveryPhrase(rawMnemonic: string): Promise<TokenCoreAgentWallet> {
+  if (!isWebTokenCoreAvailable()) {
+    throw new Error("Recovery phrase import only runs in the browser.");
+  }
+  const mnemonic = normalizeRecoveryPhrase(rawMnemonic);
+  if (mnemonic.split(" ").length < 12) {
+    throw new Error("Enter a complete recovery phrase before importing.");
+  }
+
+  const { accessToken, user } = await getGoogleAccessTokenForServer({ prompt: "consent" });
+  const passkey = await createPasskeyPrfKey({
+    email: user.email,
+    name: user.name,
+    userId: user.sub,
+  });
+  const tcx = await loadTcxWasm();
+  const keystoreJson = tcx.create_keystore(
+    JSON.stringify({
+      credentialId: passkey.credentialId,
+      mnemonic,
+      network: "MAINNET",
+      prfKey: passkey.prfKeyHex,
+      rpId: passkey.rpId,
+      userId: user.sub,
+    }),
+  );
+  const account = deriveEvmAccount(tcx, {
+    key: passkey.prfKeyHex,
+    keystoreJson,
+  });
+  const stored: StoredWebWallet = {
+    address: account.address,
+    credentialId: passkey.credentialId,
+    googleEmail: user.email,
+    googleName: user.name,
+    googleSub: user.sub,
+    id: makeWebWalletId(user.sub),
+    keystoreJson,
+    rpId: passkey.rpId,
+  };
+  storeWebWallet(stored);
+  try {
+    await uploadStoredWebTokenCoreCloudBackup(stored, accessToken, user);
+    lastWalletSyncNotice = "Recovery phrase imported locally and encrypted Google backup saved. The phrase was never sent to the server.";
+    appendWalletActivityRecord({
+      detail: `Imported ${shortAddress(stored.address)} from recovery phrase and saved encrypted Google wallet backup.`,
+      kind: "wallet_restored",
+      source: "wallet",
+      status: "restored",
+      title: "Recovery phrase imported",
+    });
+  } catch (error) {
+    lastWalletSyncNotice = `Recovery phrase imported locally, but Google backup upload failed: ${formatErrorMessage(error)}. The phrase was never sent to the server.`;
+    appendWalletActivityRecord({
+      detail: `Imported ${shortAddress(stored.address)} from recovery phrase locally. Google wallet backup upload failed.`,
+      kind: "wallet_restored",
+      source: "wallet",
+      status: "restored",
+      title: "Recovery phrase imported locally",
+    });
+  }
+  return toTokenCoreAgentWallet(stored);
+}
+
 export function takeWebTokenCoreWalletSyncNotice() {
   const notice = lastWalletSyncNotice;
   lastWalletSyncNotice = null;
@@ -404,12 +470,27 @@ async function unlockStoredWebWallet() {
 
 async function loadTcxWasm() {
   if (!tcxWasmPromise) {
-    tcxWasmPromise = import("@consenlabs/tcx-wasm").then(async (tcx) => {
-      await tcx.default({ module_or_path: "/tcx_wasm_bg.wasm" });
+    tcxWasmPromise = importTcxWasmModule().then(async (tcx) => {
+      await tcx.default({ module_or_path: TCX_WASM_BINARY_PATH });
       return tcx;
     });
   }
   return tcxWasmPromise;
+}
+
+async function importTcxWasmModule(): Promise<TcxWasmModule> {
+  if (process.env.EXPO_OS === "web" && typeof window !== "undefined") {
+    const moduleUrl = new URL(TCX_WASM_MODULE_PATH, window.location.origin).toString();
+    return importBrowserModule<TcxWasmModule>(moduleUrl);
+  }
+  return import("@consenlabs/tcx-wasm");
+}
+
+function importBrowserModule<TModule>(moduleUrl: string): Promise<TModule> {
+  const dynamicImport = new Function("moduleUrl", "return import(moduleUrl)") as (
+    moduleUrl: string,
+  ) => Promise<TModule>;
+  return dynamicImport(moduleUrl);
 }
 
 function deriveEvmAccount(
@@ -467,6 +548,15 @@ function getWalletStorageKey(googleSub: string) {
 
 function makeWebWalletId(googleSub: string) {
   return `web-google-passkey-${googleSub}`;
+}
+
+function normalizeRecoveryPhrase(rawMnemonic: string) {
+  return rawMnemonic
+    .trim()
+    .toLowerCase()
+    .split(/\s+/)
+    .filter(Boolean)
+    .join(" ");
 }
 
 function parseWebWalletBackup(rawJson: string): WebWalletBackup {

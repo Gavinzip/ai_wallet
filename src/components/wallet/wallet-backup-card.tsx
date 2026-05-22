@@ -15,16 +15,44 @@ export function WalletBackupCard() {
   const [recoveryPhrase, setRecoveryPhrase] = useState<string | null>(null);
   const [isWorking, setIsWorking] = useState(false);
 
-  const exportBackup = async () => {
+  const exportMnemonic = async () => {
+    setIsWorking(true);
+    setStatus(null);
+    setRecoveryPhrase(null);
+    try {
+      const exported = await exportWebTokenCoreRecoveryPhrase();
+      const addressSuffix = exported.address.slice(2, 10).toLowerCase();
+      downloadTextFile(
+        `token-core-recovery-${addressSuffix}.txt`,
+        [
+          "Token Core Wallet Recovery Phrase",
+          "",
+          "Anyone with this phrase can control the wallet. Keep it offline and never paste it into a website you do not trust.",
+          "",
+          exported.mnemonic,
+          "",
+          `Address: ${exported.address}`,
+        ].join("\n"),
+        "text/plain;charset=utf-8",
+      );
+      setStatus(`Recovery phrase exported for ${exported.address}. This is the wallet-level secret.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not export recovery phrase.");
+    } finally {
+      setIsWorking(false);
+    }
+  };
+
+  const exportEncryptedBackup = async () => {
     setIsWorking(true);
     setStatus(null);
     setRecoveryPhrase(null);
     try {
       const backup = await exportWebTokenCoreWalletBackup();
-      downloadTextFile(backup.filename, backup.json);
-      setStatus(`Encrypted backup exported for ${backup.address}. Keep it with access to the same passkey/domain.`);
+      downloadTextFile(backup.filename, backup.json, "application/json;charset=utf-8");
+      setStatus(`Encrypted JSON backup exported for ${backup.address}. It still needs the same Google account, passkey, and domain to restore.`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not export wallet backup.");
+      setStatus(error instanceof Error ? error.message : "Could not export encrypted wallet backup.");
     } finally {
       setIsWorking(false);
     }
@@ -112,11 +140,22 @@ export function WalletBackupCard() {
         <BackupButton
           disabled={isWorking}
           icon="download"
-          label="Export Backup"
+          label="Export Mnemonic"
           onPress={() => {
-            void exportBackup();
+            void exportMnemonic();
           }}
         />
+        <BackupButton
+          disabled={isWorking}
+          icon="eye"
+          label="Show Mnemonic"
+          onPress={() => {
+            void revealRecoveryPhrase();
+          }}
+        />
+      </View>
+
+      <View style={{ flexDirection: "row", gap: 10 }}>
         <BackupButton
           disabled={isWorking}
           icon="cloud-upload"
@@ -130,18 +169,18 @@ export function WalletBackupCard() {
       <View style={{ flexDirection: "row", gap: 10 }}>
         <BackupButton
           disabled={isWorking}
-          icon="cloud-download"
-          label="Restore Google Backup"
+          icon="download"
+          label="Export Encrypted JSON"
           onPress={() => {
-            void restoreCloudBackup();
+            void exportEncryptedBackup();
           }}
         />
         <BackupButton
           disabled={isWorking}
-          icon="eye"
-          label="Show Recovery"
+          icon="cloud-download"
+          label="Restore Google Backup"
           onPress={() => {
-            void revealRecoveryPhrase();
+            void restoreCloudBackup();
           }}
         />
       </View>
@@ -220,11 +259,11 @@ function BackupButton({
   );
 }
 
-function downloadTextFile(filename: string, text: string) {
+function downloadTextFile(filename: string, text: string, type: string) {
   if (typeof document === "undefined") {
     throw new Error("Backup download only runs in the browser.");
   }
-  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
+  const blob = new Blob([text], { type });
   const url = URL.createObjectURL(blob);
   const anchor = document.createElement("a");
   anchor.href = url;

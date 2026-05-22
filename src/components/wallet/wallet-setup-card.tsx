@@ -3,10 +3,16 @@ import { useState } from "react";
 import { Pressable, Text, TextInput, View } from "react-native";
 
 import {
+  importWebTokenCoreRecoveryPhrase,
   restoreWebTokenCoreCloudBackup,
   restoreWebTokenCoreWalletBackup,
+  takeWebTokenCoreWalletSyncNotice,
 } from "@/services/token-core/token-core-web-wallet-adapter";
-import { createOrUnlockTokenCoreWallet, type WalletRuntimeSnapshot } from "@/services/wallet/wallet-runtime";
+import {
+  createOrUnlockTokenCoreWallet,
+  loadWalletRuntimeSnapshot,
+  type WalletRuntimeSnapshot,
+} from "@/services/wallet/wallet-runtime";
 import { colors, radii, shadows } from "@/theme/tokens";
 
 type WalletSetupCardProps = {
@@ -18,6 +24,7 @@ type WalletSetupCardProps = {
 export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupCardProps) {
   const [password, setPassword] = useState("");
   const [backupJson, setBackupJson] = useState("");
+  const [recoveryPhrase, setRecoveryPhrase] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [isWorking, setIsWorking] = useState(false);
   const webMode = mode === "token-core-web";
@@ -59,6 +66,27 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
       setStatus(`Wallet restored: ${snapshot.summary.address}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not restore wallet backup.");
+    } finally {
+      setIsWorking(false);
+    }
+  };
+
+  const handleImportRecoveryPhrase = async () => {
+    if (recoveryPhrase.trim().split(/\s+/).filter(Boolean).length < 12) {
+      setStatus("Paste the full recovery phrase first.");
+      return;
+    }
+
+    setIsWorking(true);
+    setStatus(null);
+    try {
+      await importWebTokenCoreRecoveryPhrase(recoveryPhrase);
+      const snapshot = await loadWalletRuntimeSnapshot();
+      onWalletLoaded(snapshot);
+      setRecoveryPhrase("");
+      setStatus(takeWebTokenCoreWalletSyncNotice() ?? `Recovery phrase imported: ${snapshot.summary.address}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not import recovery phrase.");
     } finally {
       setIsWorking(false);
     }
@@ -140,8 +168,10 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
           <TextInput
             editable={!disabled && !isWorking}
             multiline
-            onChangeText={setBackupJson}
-            placeholder="Optional: paste encrypted web wallet backup JSON to restore"
+            autoCapitalize="none"
+            autoCorrect={false}
+            onChangeText={setRecoveryPhrase}
+            placeholder="Paste recovery phrase to import this wallet locally"
             placeholderTextColor={colors.textSoft}
             style={{
               backgroundColor: colors.surfaceMuted,
@@ -154,31 +184,31 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
               paddingHorizontal: 14,
               paddingVertical: 12,
             }}
-            value={backupJson}
+            value={recoveryPhrase}
           />
           <Pressable
-            accessibilityLabel="Restore web wallet backup"
+            accessibilityLabel="Import wallet recovery phrase"
             accessibilityRole="button"
-            disabled={disabled || isWorking || backupJson.trim().length === 0}
+            disabled={disabled || isWorking || recoveryPhrase.trim().length === 0}
             onPress={() => {
-              void handleRestoreBackup();
+              void handleImportRecoveryPhrase();
             }}
             style={{
               alignItems: "center",
-              backgroundColor: colors.surfaceMuted,
-              borderColor: colors.border,
+              backgroundColor: colors.ink,
+              borderColor: colors.ink,
               borderRadius: radii.pill,
               borderWidth: 1,
               flexDirection: "row",
               gap: 9,
               justifyContent: "center",
               minHeight: 44,
-              opacity: disabled || isWorking || backupJson.trim().length === 0 ? 0.55 : 1,
+              opacity: disabled || isWorking || recoveryPhrase.trim().length === 0 ? 0.55 : 1,
             }}
           >
-            <KeyRound color={colors.text} size={16} strokeWidth={2.4} />
-            <Text style={{ color: colors.text, fontSize: 14, fontWeight: "900" }}>
-              Restore Backup
+            <KeyRound color="#FFFFFF" size={16} strokeWidth={2.4} />
+            <Text style={{ color: "#FFFFFF", fontSize: 14, fontWeight: "900" }}>
+              Import Mnemonic Locally
             </Text>
           </Pressable>
           <Pressable
@@ -204,6 +234,52 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
             <CloudDownload color={colors.blue} size={16} strokeWidth={2.4} />
             <Text style={{ color: colors.blue, fontSize: 14, fontWeight: "900" }}>
               Restore Google Wallet Backup
+            </Text>
+          </Pressable>
+          <TextInput
+            editable={!disabled && !isWorking}
+            multiline
+            autoCapitalize="none"
+            autoCorrect={false}
+            onChangeText={setBackupJson}
+            placeholder="Advanced: paste encrypted wallet backup JSON"
+            placeholderTextColor={colors.textSoft}
+            style={{
+              backgroundColor: colors.surfaceMuted,
+              borderColor: colors.border,
+              borderRadius: radii.md,
+              borderWidth: 1,
+              color: colors.text,
+              fontSize: 13,
+              minHeight: 64,
+              paddingHorizontal: 14,
+              paddingVertical: 12,
+            }}
+            value={backupJson}
+          />
+          <Pressable
+            accessibilityLabel="Restore encrypted web wallet backup JSON"
+            accessibilityRole="button"
+            disabled={disabled || isWorking || backupJson.trim().length === 0}
+            onPress={() => {
+              void handleRestoreBackup();
+            }}
+            style={{
+              alignItems: "center",
+              backgroundColor: colors.surfaceMuted,
+              borderColor: colors.border,
+              borderRadius: radii.pill,
+              borderWidth: 1,
+              flexDirection: "row",
+              gap: 9,
+              justifyContent: "center",
+              minHeight: 44,
+              opacity: disabled || isWorking || backupJson.trim().length === 0 ? 0.55 : 1,
+            }}
+          >
+            <KeyRound color={colors.text} size={16} strokeWidth={2.4} />
+            <Text style={{ color: colors.text, fontSize: 14, fontWeight: "900" }}>
+              Restore Encrypted JSON
             </Text>
           </Pressable>
         </View>
