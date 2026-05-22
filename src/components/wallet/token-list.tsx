@@ -19,7 +19,7 @@ export function TokenList({ tokens }: TokenListProps) {
         }}
       >
         <Text style={{ color: colors.textMuted, fontSize: 22, fontWeight: "500" }}>
-          Explore tokens
+          Verified EVM balances
         </Text>
         <Pressable
           accessibilityLabel="Manage tokens"
@@ -59,7 +59,7 @@ export function TokenList({ tokens }: TokenListProps) {
             No verified balances loaded
           </Text>
           <Text style={{ color: colors.textMuted, fontSize: 14, lineHeight: 20 }}>
-            Balance rows will appear only after Token Core wallet access and a real chain balance provider are connected.
+            Create or unlock a Token Core wallet to read native ETH/BNB/POL and verified token contracts from real EVM RPCs.
           </Text>
         </View>
       )}

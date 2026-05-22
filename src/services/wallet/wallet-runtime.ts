@@ -5,6 +5,10 @@ import {
   takeWebTokenCoreWalletSyncNotice,
   type TokenCoreAgentWallet,
 } from "@/services/token-core/token-core-wallet-adapter";
+import {
+  readVerifiedEvmWalletTokens,
+  summarizeNativeBalances,
+} from "@/services/wallet/evm-token-balances";
 import type { WalletSummary, WalletToken } from "@/types/wallet";
 
 export type WalletRuntimeSnapshot = {
@@ -78,8 +82,9 @@ export async function createOrUnlockTokenCoreWallet(password: string): Promise<W
 
   if (adapter.mode === "web-token-core") {
     const wallet = await adapter.createAgentIdentityWallet();
+    const snapshot = await createWalletRuntimeSnapshot(wallet);
     return {
-      ...createWalletRuntimeSnapshot(wallet),
+      ...snapshot,
       setupNotice: takeWebTokenCoreWalletSyncNotice() ?? undefined,
     };
   }
@@ -93,7 +98,14 @@ export async function createOrUnlockTokenCoreWallet(password: string): Promise<W
   return createWalletRuntimeSnapshot(wallet);
 }
 
-function createWalletRuntimeSnapshot(wallet: TokenCoreAgentWallet): WalletRuntimeSnapshot {
+async function createWalletRuntimeSnapshot(wallet: TokenCoreAgentWallet): Promise<WalletRuntimeSnapshot> {
+  const { failedChains, tokens } = await readVerifiedEvmWalletTokens(wallet.address);
+  const nativeBalanceSummary = summarizeNativeBalances(tokens);
+  const balanceReadNotice =
+    failedChains.length > 0
+      ? ` Some network balance reads failed: ${failedChains.join(", ")}.`
+      : "";
+
   return {
     canTransact: true,
     summary: {
@@ -104,10 +116,10 @@ function createWalletRuntimeSnapshot(wallet: TokenCoreAgentWallet): WalletRuntim
       name: wallet.label,
       statusMessage:
         wallet.source === "web-token-core"
-          ? "Self-custodial Token Core WASM wallet is loaded in this browser. Signing uses Google account presence plus Passkey PRF unlock."
-          : "Self-custodial Token Core wallet is loaded on this device. Balances appear only after real BSC balance reads are enabled.",
-      totalValue: null,
+          ? `Self-custodial Token Core WASM wallet is loaded. EVM balances are read from verified RPC/token contracts; signing stays local with Passkey PRF.${balanceReadNotice}`
+          : `Self-custodial Token Core wallet is loaded on this device. EVM balances are read from verified RPC/token contracts.${balanceReadNotice}`,
+      totalValue: nativeBalanceSummary,
     },
-    tokens: [],
+    tokens,
   };
 }

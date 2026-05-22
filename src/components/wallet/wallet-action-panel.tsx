@@ -349,43 +349,31 @@ function SwapPanel({
       <TextInput
         keyboardType="decimal-pad"
         onChangeText={setAmount}
-        placeholder="Amount in BNB"
+        placeholder="BNB amount to swap"
         placeholderTextColor={colors.textSoft}
         style={inputStyle}
         value={amount}
       />
-      <View style={{ flexDirection: "row", gap: 8 }}>
-        {outputTokens.map((token) => {
-          const selected = outputSymbol === token;
-          return (
-            <Pressable
-              accessibilityLabel={`Swap to ${token}`}
-              accessibilityRole="button"
+      <View style={{ gap: 8 }}>
+        <Text style={{ color: colors.textSoft, fontSize: 11, fontWeight: "900" }}>
+          FROM
+        </Text>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          <TokenChip label="BNB" selected />
+        </View>
+        <Text style={{ color: colors.textSoft, fontSize: 11, fontWeight: "900", marginTop: 4 }}>
+          TO
+        </Text>
+        <View style={{ flexDirection: "row", gap: 8 }}>
+          {outputTokens.map((token) => (
+            <TokenChip
               key={token}
+              label={token}
               onPress={() => setOutputSymbol(token)}
-              style={{
-                alignItems: "center",
-                backgroundColor: selected ? colors.blueSoft : colors.surfaceMuted,
-                borderColor: selected ? colors.blue : colors.border,
-                borderRadius: radii.pill,
-                borderWidth: 1,
-                flex: 1,
-                minHeight: 42,
-                justifyContent: "center",
-              }}
-            >
-              <Text
-                style={{
-                  color: selected ? colors.blue : colors.textMuted,
-                  fontSize: 13,
-                  fontWeight: "900",
-                }}
-              >
-                {token}
-              </Text>
-            </Pressable>
-          );
-        })}
+              selected={outputSymbol === token}
+            />
+          ))}
+        </View>
       </View>
       <Pressable
         accessibilityLabel="Prepare PancakeSwap intent"
@@ -409,6 +397,45 @@ function SwapPanel({
         />
       ) : null}
     </View>
+  );
+}
+
+function TokenChip({
+  label,
+  onPress,
+  selected,
+}: {
+  label: string;
+  onPress?: () => void;
+  selected: boolean;
+}) {
+  return (
+    <Pressable
+      accessibilityLabel={onPress ? `Select ${label}` : `${label} selected`}
+      accessibilityRole="button"
+      disabled={!onPress}
+      onPress={onPress}
+      style={{
+        alignItems: "center",
+        backgroundColor: selected ? colors.blueSoft : colors.surfaceMuted,
+        borderColor: selected ? colors.blue : colors.border,
+        borderRadius: radii.pill,
+        borderWidth: 1,
+        flex: 1,
+        justifyContent: "center",
+        minHeight: 42,
+      }}
+    >
+      <Text
+        style={{
+          color: selected ? colors.blue : colors.textMuted,
+          fontSize: 13,
+          fontWeight: "900",
+        }}
+      >
+        {label}
+      </Text>
+    </Pressable>
   );
 }
 

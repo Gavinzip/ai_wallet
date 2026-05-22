@@ -10,7 +10,8 @@ type TokenRowProps = {
 };
 
 export function TokenRow({ token }: TokenRowProps) {
-  const isPositive = token.change >= 0;
+  const hasMarketData = typeof token.change === "number" && token.sparkline.length > 0;
+  const isPositive = (token.change ?? 0) >= 0;
   const changeColor = isPositive ? colors.mint : colors.red;
 
   return (
@@ -45,34 +46,38 @@ export function TokenRow({ token }: TokenRowProps) {
           {token.name}
         </Text>
         <Text numberOfLines={1} style={{ color: colors.textSoft, fontSize: 18 }}>
-          {token.symbol}
+          {token.chain ? `${token.symbol} · ${token.chain}` : token.symbol}
         </Text>
       </View>
 
-      <View style={{ alignItems: "center", minWidth: 78 }}>
-        <MiniSparkline color={changeColor} data={token.sparkline} />
-      </View>
+      {hasMarketData ? (
+        <View style={{ alignItems: "center", minWidth: 78 }}>
+          <MiniSparkline color={changeColor} data={token.sparkline} />
+        </View>
+      ) : null}
 
-      <View style={{ alignItems: "flex-end", minWidth: 86 }}>
+      <View style={{ alignItems: "flex-end", minWidth: 120 }}>
         <Text
           style={{
             color: colors.text,
-            fontSize: 20,
+            fontSize: 18,
             fontVariant: ["tabular-nums"],
-            fontWeight: "500",
+            fontWeight: "800",
           }}
         >
-          {token.fiatValue}
+          {token.balanceLabel}
         </Text>
         <Text
+          numberOfLines={1}
           style={{
-            color: changeColor,
-            fontSize: 15,
+            color: hasMarketData ? changeColor : colors.textSoft,
+            fontSize: 12,
             fontVariant: ["tabular-nums"],
             fontWeight: "600",
+            maxWidth: 160,
           }}
         >
-          {formatSignedPercent(token.change)}
+          {hasMarketData ? formatSignedPercent(token.change ?? 0) : token.fiatValue}
         </Text>
       </View>
     </View>

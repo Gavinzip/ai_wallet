@@ -37,6 +37,13 @@ const STATIC_DIST_DIR = path.resolve(process.env.WEB_DIST_DIR ?? path.join(proje
 const PANCAKESWAP_SWAP_URL = "https://pancakeswap.finance/swap";
 const PANCAKESWAP_V2_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E";
 const PANCAKESWAP_OUTPUTS = new Set(["USDC", "USDT", "CAKE"]);
+const BSC_TRANSFER_TOKENS = new Map([
+  ["BNB", { decimals: 18, native: true, symbol: "BNB" }],
+  ["USDT", { address: "0x55d398326f99059fF775485246999027B3197955", decimals: 18, symbol: "USDT" }],
+  ["USDC", { address: "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d", decimals: 18, symbol: "USDC" }],
+  ["CAKE", { address: "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82", decimals: 18, symbol: "CAKE" }],
+  ["WBNB", { address: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", decimals: 18, symbol: "WBNB" }],
+]);
 const VENUS_APP_URL = "https://app.venus.io/";
 const LISTA_APP_URL = "https://lista.org/";
 const PUFFER_MAINNET = Chain.Mainnet;
@@ -54,6 +61,16 @@ const BITREFILL_API_BASE_URL = trimTrailingSlash(
 const ETHEREUM_RPC_URL = process.env.ETHEREUM_RPC_URL ?? "https://ethereum-rpc.publicnode.com";
 const HOLESKY_RPC_URL = process.env.HOLESKY_RPC_URL ?? "https://holesky.drpc.org";
 const SEPOLIA_RPC_URL = process.env.SEPOLIA_RPC_URL ?? "https://ethereum-sepolia-rpc.publicnode.com";
+const BSC_RPC_URL =
+  process.env.BSC_RPC_URL ?? process.env.EXPO_PUBLIC_BSC_RPC_URL ?? "https://bsc-dataseed-public.bnbchain.org";
+const BSC_TESTNET_RPC_URL =
+  process.env.BSC_TESTNET_RPC_URL ??
+  process.env.EXPO_PUBLIC_BSC_TESTNET_RPC_URL ??
+  "https://bsc-testnet-dataseed.bnbchain.org";
+const BASE_RPC_URL =
+  process.env.BASE_RPC_URL ?? process.env.EXPO_PUBLIC_BASE_RPC_URL ?? "https://mainnet.base.org";
+const POLYGON_RPC_URL =
+  process.env.POLYGON_RPC_URL ?? process.env.EXPO_PUBLIC_POLYGON_RPC_URL ?? "https://polygon-bor-rpc.publicnode.com";
 const RENAISS_SCAN_CACHE_PATH = process.env.RENAISS_SCAN_CACHE_PATH ??
   path.join(process.cwd(), ".tmp", "renaiss-scan-cache.json");
 const WEB_WALLET_BACKUP_DIR = process.env.WEB_WALLET_BACKUP_DIR ??
@@ -199,8 +216,11 @@ const server = http.createServer(async (request, response) => {
     return;
   }
 
-  if (request.method === "POST" && requestUrl.pathname === "/api/ethereum/rpc") {
-    await handleEthereumRpcProxy(request, response);
+  if (
+    request.method === "POST" &&
+    (requestUrl.pathname === "/api/ethereum/rpc" || requestUrl.pathname === "/api/evm/rpc")
+  ) {
+    await handleEvmRpcProxy(request, response);
     return;
   }
 
@@ -265,6 +285,18 @@ async function handleAgentChat(request, response) {
     }
 
     const lastUserMessage = [...messages].reverse().find((message) => message.role === "user")?.content ?? "";
+    const semanticActionRoute = await classifyWalletActionRoute({ enabledSkills, lastUserMessage, messages });
+    if (await handleSemanticWalletActionRoute({
+      enabledSkills,
+      lastUserMessage,
+      messages,
+      response,
+      route: semanticActionRoute,
+      walletAddress,
+    })) {
+      return;
+    }
+
     if (isContextualRecommendationRequest(lastUserMessage)) {
       if (hasBitrefillSkill(enabledSkills) && hasRecentBitrefillContext(messages)) {
         await handleBitrefillRecommendationChat(lastUserMessage, response);
@@ -281,8 +313,31 @@ async function handleAgentChat(request, response) {
       await handleBitrefillChat(lastUserMessage, response);
       return;
     }
+    if (hasBitrefillSkill(enabledSkills) && hasRecentBitrefillContext(messages) && isBitrefillPaymentQuestion(lastUserMessage)) {
+      await handleBitrefillPaymentQuestionChat(response);
+      return;
+    }
     if (hasPufferSkill(enabledSkills) && isPufferRequest(lastUserMessage)) {
       await handlePufferChat(lastUserMessage, response);
+      return;
+    }
+    if (isWalletTransferRequest(lastUserMessage)) {
+      await handleBscTransferChat(lastUserMessage, response, walletAddress);
+      return;
+    }
+    const semanticRenaissRoute = hasRenaissSkill(enabledSkills)
+      ? await classifyRenaissChatRoute({ enabledSkills, lastUserMessage, messages })
+      : null;
+    if (semanticRenaissRoute?.intent === "listing") {
+      await handleRenaissListingChat(lastUserMessage, response, walletAddress);
+      return;
+    }
+    if (semanticRenaissRoute?.intent === "purchase") {
+      await handleRenaissPurchaseChat(messages, response, walletAddress);
+      return;
+    }
+    if (semanticRenaissRoute?.intent === "recommendation") {
+      await handleRenaissChatRecommendation(lastUserMessage, response);
       return;
     }
     if (hasRenaissSkill(enabledSkills) && isRenaissListingRequest(lastUserMessage)) {
@@ -295,7 +350,7 @@ async function handleAgentChat(request, response) {
     }
     if (
       hasRenaissSkill(enabledSkills)
-      && isGenericPurchaseRequest(lastUserMessage)
+      && (isGenericPurchaseRequest(lastUserMessage) || isRenaissShortPurchaseConfirmation(lastUserMessage))
       && findLatestRenaissPurchaseContext(messages)
     ) {
       await handleRenaissPurchaseChat(messages, response, walletAddress);
@@ -372,6 +427,183 @@ async function handleAgentChat(request, response) {
       error: error instanceof Error ? error.message : "Agent chat failed.",
     });
   }
+}
+
+async function classifyWalletActionRoute({ enabledSkills, lastUserMessage, messages }) {
+  const apiKey = process.env.MINIMAX_API_KEY;
+  if (!apiKey) return null;
+
+  const model = process.env.MINIMAX_MODEL ?? "MiniMax-M2.7";
+  const baseUrl = process.env.MINIMAX_BASE_URL ?? "https://api.minimax.io/v1";
+  const minimaxResponse = await fetch(`${baseUrl}/chat/completions`, {
+    body: JSON.stringify({
+      messages: [
+        {
+          content: [
+            "你是自託管錢包 agent 的 action router。",
+            "你的任務是把使用者自然語言整理成固定 schema；你不能回答使用者、不能產生 wallet intent、不能產生交易 payload。",
+            "如果欄位缺失，要放在 missingFields，不要猜。",
+            "只回傳 strict JSON：",
+            "{\"intent\":\"transfer|swap|bitrefill_search|bitrefill_payment_question|puffer|renaiss_listing|renaiss_purchase|renaiss_recommendation|bsc_defi_review|generic_purchase|none\",\"confidence\":0,\"fields\":{\"chain\":null,\"token\":null,\"amount\":null,\"toAddress\":null,\"fromToken\":null,\"toToken\":null,\"protocol\":null,\"productQuery\":null,\"country\":null,\"denomination\":null,\"cardUrl\":null,\"tokenId\":null,\"askPrice\":null},\"missingFields\":[\"string\"],\"reason\":\"string\"}",
+            "transfer = 使用者要轉帳、發送、匯款、send、transfer。",
+            "swap = 使用者要 swap / 兌換，尤其 PancakeSwap 或 BNB 換 USDC/USDT/CAKE。",
+            "bitrefill_search = 使用者要找或買 Bitrefill 商品、禮品卡、eSIM、儲值。",
+            "bitrefill_payment_question = 使用者在 Bitrefill 上下文問付款幣種、用什麼貨幣、currency、payment。",
+            "puffer = 使用者問 Puffer / pufETH / UniFi vault / ETH staking。",
+            "renaiss_listing = 使用者要 RENAISS 掛單、上架、出售、賣卡、設定 ask price。",
+            "renaiss_purchase = 使用者要買入先前推薦或分析過的 RENAISS 卡，或對購買流程確認。",
+            "renaiss_recommendation = 使用者要 RENAISS 特價卡、卡牌推薦、價格分析、警報、撿漏列表。",
+            "bsc_defi_review = Venus、Lista 或其他 BSC DeFi 風險審核。",
+            "generic_purchase = 使用者只說要購買但沒有商品/平台/鏈上動作。",
+            "none = 一般聊天或無法判定。",
+            "重要：掛單/上架/出售/賣 永遠優先 renaiss_listing，不要分類為 renaiss_purchase。",
+            "重要：轉帳時必須抽出 chain、token、amount、toAddress；缺任何一個就放 missingFields。",
+          ].join("\n"),
+          role: "system",
+        },
+        {
+          content: JSON.stringify({
+            enabledSkills: enabledSkills.map((skill) => ({
+              name: skill.name,
+              policySummary: skill.policySummary,
+              trigger: skill.trigger,
+            })),
+            hasRecentBitrefillContext: hasRecentBitrefillContext(messages),
+            hasRecentRenaissContext: hasRecentRenaissContext(messages),
+            lastUserMessage: stringOrEmpty(lastUserMessage).slice(0, 800),
+            recentMessages: messages.slice(-8).map((message) => ({
+              content: stringOrEmpty(message.content).slice(0, 900),
+              role: message.role,
+            })),
+            recentRenaissPurchaseContext: findLatestRenaissPurchaseContext(messages),
+          }),
+          role: "user",
+        },
+      ],
+      model,
+      response_format: { type: "json_object" },
+      temperature: 0,
+    }),
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+
+  let data;
+  try {
+    data = await minimaxResponse.json();
+  } catch {
+    data = null;
+  }
+  if (!minimaxResponse.ok) {
+    throw new Error(data?.error?.message ?? data?.base_resp?.status_msg ?? "MiniMax action route classification failed.");
+  }
+
+  const rawContent = data?.choices?.[0]?.message?.content;
+  if (typeof rawContent !== "string" || rawContent.length === 0) {
+    throw new Error("MiniMax action route classification did not include assistant content.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(extractFirstJsonObject(rawContent));
+  } catch {
+    throw new Error("MiniMax action route classification was not strict JSON.");
+  }
+
+  const intent = stringOrEmpty(parsed.intent).toLowerCase();
+  const allowed = new Set([
+    "transfer",
+    "swap",
+    "bitrefill_search",
+    "bitrefill_payment_question",
+    "puffer",
+    "renaiss_listing",
+    "renaiss_purchase",
+    "renaiss_recommendation",
+    "bsc_defi_review",
+    "generic_purchase",
+    "none",
+  ]);
+  if (!allowed.has(intent)) {
+    throw new Error("MiniMax action route classification returned an unknown intent.");
+  }
+
+  return {
+    confidence: nullableNumber(parsed.confidence, 0, 100) ?? 0,
+    fields: parsed.fields && typeof parsed.fields === "object" ? parsed.fields : {},
+    intent,
+    missingFields: Array.isArray(parsed.missingFields)
+      ? parsed.missingFields.map((item) => stringOrEmpty(item)).filter(Boolean).slice(0, 8)
+      : [],
+    model,
+    reason: stringOrEmpty(parsed.reason).slice(0, 240),
+  };
+}
+
+async function handleSemanticWalletActionRoute({
+  enabledSkills,
+  lastUserMessage,
+  messages,
+  response,
+  route,
+  walletAddress,
+}) {
+  if (!route || route.intent === "none" || route.confidence < 50) return false;
+
+  if (route.intent === "transfer") {
+    await handleBscTransferChat(lastUserMessage, response, walletAddress, route.fields);
+    return true;
+  }
+
+  if (route.intent === "swap") {
+    await handlePancakeSwapActionChat(route.fields, response);
+    return true;
+  }
+
+  if (route.intent === "bitrefill_payment_question" && hasBitrefillSkill(enabledSkills)) {
+    await handleBitrefillPaymentQuestionChat(response);
+    return true;
+  }
+
+  if (route.intent === "bitrefill_search" && hasBitrefillSkill(enabledSkills)) {
+    await handleBitrefillChat(lastUserMessage, response);
+    return true;
+  }
+
+  if (route.intent === "puffer" && hasPufferSkill(enabledSkills)) {
+    await handlePufferChat(lastUserMessage, response);
+    return true;
+  }
+
+  if (route.intent === "renaiss_listing" && hasRenaissSkill(enabledSkills)) {
+    await handleRenaissListingChat(lastUserMessage, response, walletAddress);
+    return true;
+  }
+
+  if (route.intent === "renaiss_purchase" && hasRenaissSkill(enabledSkills)) {
+    await handleRenaissPurchaseChat(messages, response, walletAddress);
+    return true;
+  }
+
+  if (route.intent === "renaiss_recommendation" && hasRenaissSkill(enabledSkills)) {
+    await handleRenaissChatRecommendation(lastUserMessage, response);
+    return true;
+  }
+
+  if (route.intent === "bsc_defi_review") {
+    await handleBscDefiChat(lastUserMessage, response);
+    return true;
+  }
+
+  if (route.intent === "generic_purchase") {
+    await handleGenericPurchaseChat(response);
+    return true;
+  }
+
+  return false;
 }
 
 async function handleWebWalletBackupGet(request, response) {
@@ -1335,6 +1567,24 @@ async function handleBitrefillRecommendationChat(userMessage, response) {
   }
 }
 
+async function handleBitrefillPaymentQuestionChat(response) {
+  sendJson(response, 200, {
+    intent: null,
+    message: [
+      "你剛剛查的是 Bitrefill US 商品，所以商品面額通常是 USD；例如 Steam USD 就是美元面額。",
+      "但「付款幣種」不是我用猜的，要建立 Bitrefill invoice 時由 Bitrefill 回傳實際 payment method、幣種、地址和金額。",
+      "如果你要買，直接說商品和面額，例如：「用 Bitrefill 買 Steam US 20 美元」。",
+      "我會再打真 API 建立/審核 invoice；如果付款幣種是目前錢包支援的鏈上資產，才會建立本機 Token Core 簽名付款 intent。",
+    ].join("\n"),
+    model: "bitrefill-api",
+  });
+}
+
+function isBitrefillPaymentQuestion(value) {
+  const text = stringOrEmpty(value).toLowerCase();
+  return /用什麼貨幣|用什么货币|付款幣種|付款币种|支付幣種|支付币种|什麼幣|什么币|currency|pay with|payment/.test(text);
+}
+
 async function handleRecommendationClarificationChat(response) {
   sendJson(response, 200, {
     intent: null,
@@ -1848,7 +2098,7 @@ async function handleBitrefillProductSearch(requestUrl, response) {
   }
 }
 
-async function handleEthereumRpcProxy(request, response) {
+async function handleEvmRpcProxy(request, response) {
   try {
     const body = await readJson(request);
     const chainId = stringOrEmpty(body.chainId ?? body.networkChainId).trim() || "1";
@@ -1868,7 +2118,7 @@ async function handleEthereumRpcProxy(request, response) {
       return;
     }
 
-    const upstream = await fetch(getServerEthereumRpcUrl(chainId), {
+    const upstream = await fetch(getServerEvmRpcUrl(chainId), {
       body: JSON.stringify({
         id: Date.now(),
         jsonrpc: "2.0",
@@ -1885,23 +2135,27 @@ async function handleEthereumRpcProxy(request, response) {
     try {
       payload = text ? JSON.parse(text) : null;
     } catch {
-      payload = { error: { message: text || "Ethereum RPC upstream returned non-JSON response." } };
+      payload = { error: { message: text || "EVM RPC upstream returned non-JSON response." } };
     }
     if (!upstream.ok) {
       sendJson(response, upstream.status, {
-        error: payload?.error?.message ?? payload?.message ?? "Ethereum RPC upstream request failed.",
+        error: payload?.error?.message ?? payload?.message ?? "EVM RPC upstream request failed.",
       });
       return;
     }
     sendJson(response, 200, payload);
   } catch (error) {
     sendJson(response, 502, {
-      error: error instanceof Error ? error.message : "Ethereum RPC proxy failed.",
+      error: error instanceof Error ? error.message : "EVM RPC proxy failed.",
     });
   }
 }
 
-function getServerEthereumRpcUrl(chainId) {
+function getServerEvmRpcUrl(chainId) {
+  if (String(chainId) === "56") return BSC_RPC_URL;
+  if (String(chainId) === "97") return BSC_TESTNET_RPC_URL;
+  if (String(chainId) === "8453") return BASE_RPC_URL;
+  if (String(chainId) === "137") return POLYGON_RPC_URL;
   if (String(chainId) === "17000") return HOLESKY_RPC_URL;
   if (String(chainId) === "11155111") return SEPOLIA_RPC_URL;
   return ETHEREUM_RPC_URL;
@@ -2306,6 +2560,303 @@ function createServerPancakeSwapIntent(input) {
     summary: `Swap ${input.amountInBnb} BNB to ${input.outputSymbol} through PancakeSwap V2 after local safety review.`,
     title: `PancakeSwap BNB to ${input.outputSymbol}`,
   };
+}
+
+async function handlePancakeSwapActionChat(fields, response) {
+  const amount = nullableFieldString(fields?.amount) ?? nullableFieldString(fields?.fromAmount);
+  const fromToken = stringOrEmpty(fields?.fromToken ?? fields?.token).toUpperCase().trim() || "BNB";
+  const outputSymbol = normalizePancakeOutputSymbol(fields?.toToken ?? fields?.outputToken);
+
+  if (fromToken && fromToken !== "BNB") {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        `我讀到你想用 ${fromToken} 做 swap，但目前對話已接好的真交易路徑只有 PancakeSwap BNB -> USDC / USDT / CAKE。`,
+        "如果要做 token-to-token swap，需要先加入 allowance/approve、路由、spender、calldata decode 和安全審核。",
+      ].join("\n"),
+      model: "deterministic-defi",
+    });
+    return;
+  }
+
+  if (!amount || !outputSymbol) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        "可以準備 PancakeSwap swap，但請補齊金額和輸出代幣。",
+        "目前支援格式例如：「用 PancakeSwap 把 0.001 BNB 換成 USDC」。",
+        "已接上的輸出代幣：USDC、USDT、CAKE。",
+      ].join("\n"),
+      model: "deterministic-defi",
+    });
+    return;
+  }
+
+  sendJson(response, 200, {
+    intent: createServerPancakeSwapIntent({ amountInBnb: amount, outputSymbol }),
+    message: `我已經準備 PancakeSwap review intent：${amount} BNB -> ${outputSymbol}。這不是送出交易，最後還要你在本機 Token Core 檢查並簽名。`,
+    model: "deterministic-defi",
+  });
+}
+
+function normalizePancakeOutputSymbol(value) {
+  const token = stringOrEmpty(value).toUpperCase().trim();
+  return PANCAKESWAP_OUTPUTS.has(token) ? token : null;
+}
+
+async function handleBscTransferChat(userMessage, response, walletAddress, semanticFields = null) {
+  const draft = extractBscTransferDraft(userMessage, semanticFields);
+
+  if (!walletAddress) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        "可以幫你準備 BNB Smart Chain 轉帳，但我需要先知道目前 Token Core wallet address。",
+        "請先在 Wallet 頁建立或解鎖 Google + Passkey / Token Core 錢包，再回來說一次轉帳指令。",
+      ].join("\n"),
+      model: "deterministic-transfer",
+    });
+    return;
+  }
+
+  if (draft.chain && !isBscLikeChain(draft.chain)) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        `我讀到你要在 ${draft.chain} 轉帳，但目前對話轉帳只接好 BNB Smart Chain。`,
+        "已接上的 BNB Smart Chain 代幣是：BNB、USDT、USDC、CAKE、WBNB。",
+        "如果要支援其他鏈，我需要先把該鏈 RPC、nonce/gas、token 合約和 explorer review 接好。",
+      ].join("\n"),
+      model: "deterministic-transfer",
+    });
+    return;
+  }
+
+  if (!draft.toAddress || !draft.amount || !draft.tokenSymbol) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        "可以幫你準備 BNB Smart Chain 轉帳，但請給完整收款地址、代幣和金額。",
+        "格式例如：",
+        "「幫我轉 0.001 BNB 到 0x...」",
+        "「轉錢給 0x... 2 USDT BNB鏈」",
+        "目前對話轉帳支援 BNB Smart Chain 的 BNB、USDT、USDC、CAKE、WBNB。",
+      ].join("\n"),
+      model: "deterministic-transfer",
+    });
+    return;
+  }
+
+  const token = BSC_TRANSFER_TOKENS.get(draft.tokenSymbol);
+  if (!token) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        `目前對話轉帳還沒有支援 ${draft.tokenSymbol}。`,
+        "已接上的 BNB Smart Chain 代幣是：BNB、USDT、USDC、CAKE、WBNB。",
+        "如果你要轉其他 BEP-20 token，我需要先把該 token 合約、decimals 和安全顯示接進白名單。",
+      ].join("\n"),
+      model: "deterministic-transfer",
+    });
+    return;
+  }
+
+  try {
+    const intent = await createServerBscTransferIntent({
+      amount: draft.amount,
+      fromAddress: walletAddress,
+      token,
+      toAddress: draft.toAddress,
+    });
+    sendJson(response, 200, {
+      intent,
+      message: [
+        `我已經準備 BNB Smart Chain ${token.symbol} 轉帳審核：${draft.amount} ${token.symbol} -> ${draft.toAddress}。`,
+        "nonce、gas price、gas limit、value/calldata 都已經從真 BSC RPC 或白名單 token 合約準備。",
+        "這還沒有送出；最後要你在本機 Token Core 檢查並簽名。",
+      ].join("\n"),
+      model: "deterministic-transfer",
+    });
+  } catch (error) {
+    sendJson(response, 200, {
+      intent: null,
+      message: [
+        "我有收到轉帳要求，但沒有產生簽名 intent，因為真鏈上檢查沒有通過。",
+        error instanceof Error ? error.message : "BSC transfer prepare failed.",
+        "我不會用 fallback 假裝可轉；請先確認餘額、gas、收款地址和代幣。",
+      ].join("\n"),
+      model: "deterministic-transfer",
+    });
+  }
+}
+
+async function createServerBscTransferIntent(input) {
+  const toAddress = normalizeServerEvmAddress(input.toAddress, "recipient");
+  const fromAddress = normalizeServerEvmAddress(input.fromAddress, "source wallet");
+  const amountValue = parseServerUnits(input.amount, input.token.decimals);
+  if (amountValue <= 0n) {
+    throw new Error(`${input.token.symbol} amount must be greater than zero.`);
+  }
+
+  const transferData = input.token.native ? "0x" : encodeServerErc20TransferData(toAddress, amountValue);
+  const txTo = input.token.native ? toAddress : input.token.address;
+  const txValue = input.token.native ? amountValue : 0n;
+  if (!input.token.native) {
+    const balance = await readServerBep20Balance({
+      address: fromAddress,
+      tokenAddress: input.token.address,
+    });
+    if (balance < amountValue) {
+      throw new Error(
+        `BSC ${input.token.symbol} 餘額不足：目前 ${formatServerUnits(balance, input.token.decimals, 8)} ${input.token.symbol}，需要 ${input.amount} ${input.token.symbol}。`,
+      );
+    }
+  }
+
+  const [nonceHex, gasPriceHex, gasEstimateHex] = await Promise.all([
+    serverEthereumRpc("eth_getTransactionCount", [fromAddress, "latest"], "56"),
+    serverEthereumRpc("eth_gasPrice", [], "56"),
+    serverEthereumRpc("eth_estimateGas", [{
+      data: transferData,
+      from: fromAddress,
+      to: txTo,
+      value: `0x${txValue.toString(16)}`,
+    }], "56"),
+  ]);
+  const gasLimit = addServerGasBuffer(BigInt(gasEstimateHex));
+  const gasPrice = BigInt(gasPriceHex);
+  const nonce = BigInt(nonceHex);
+
+  return {
+    actions: [
+      {
+        amount: `${input.amount.trim()} ${input.token.symbol}`,
+        chain: "BNB Smart Chain",
+        dappUrl: null,
+        data: transferData,
+        evmTx: {
+          chainId: "56",
+          data: transferData,
+          gasLimit: gasLimit.toString(),
+          gasPrice: gasPrice.toString(),
+          nonce: nonce.toString(),
+          to: txTo,
+          txType: "00",
+          value: txValue.toString(),
+        },
+        message: null,
+        params: {
+          gasLimit: gasLimit.toString(),
+          gasPriceWei: gasPrice.toString(),
+          nonce: nonce.toString(),
+          tokenContract: input.token.native ? null : input.token.address,
+        },
+        to: toAddress,
+        token: input.token.symbol,
+        type: "transfer",
+      },
+    ],
+    createdAt: new Date().toISOString(),
+    id: `bsc-${input.token.symbol.toLowerCase()}-transfer-${Date.now()}`,
+    requiresLocalSignature: true,
+    requiresUserConfirmation: true,
+    riskLevel: "warning",
+    safetyChecks: [
+      "Recipient is a full EVM address shown in this review.",
+      "Nonce, gas price, gas limit, and value were read from real BSC RPC before signing.",
+      input.token.native
+        ? "This is a native BNB transfer."
+        : `This is a BEP-20 transfer through the verified ${input.token.symbol} contract ${input.token.address}.`,
+      "Server and AI cannot sign this transaction.",
+      "Final signing and broadcast happen on this device through Token Core.",
+    ],
+    serverCanExecute: false,
+    status: "needs_review",
+    summary: `Send ${input.amount.trim()} ${input.token.symbol} on BNB Smart Chain after local safety review.`,
+    title: `BSC ${input.token.symbol} Transfer`,
+  };
+}
+
+function isWalletTransferRequest(value) {
+  const text = stringOrEmpty(value).toLowerCase();
+  if (/swap|pancake|puffer|venus|lista|renaiss|bitrefill/.test(text)) return false;
+  return /(轉|转|匯|汇|發送|发送|send|transfer)/.test(text);
+}
+
+function extractBscTransferDraft(value, semanticFields = null) {
+  const text = stringOrEmpty(value);
+  const tokenSymbol = normalizeBscTransferTokenSymbol(semanticFields?.token) ?? extractBscTransferTokenSymbol(text);
+  return {
+    amount: nullableFieldString(semanticFields?.amount) ?? (tokenSymbol ? extractTokenAmount(text, tokenSymbol) : extractAnyTransferAmount(text)),
+    chain: nullableFieldString(semanticFields?.chain),
+    tokenSymbol,
+    toAddress: normalizeOptionalServerEvmAddress(semanticFields?.toAddress) ?? text.match(/0x[a-fA-F0-9]{40}/)?.[0] ?? null,
+  };
+}
+
+function extractBscTransferTokenSymbol(value) {
+  const text = stringOrEmpty(value).toUpperCase();
+  const match = text.match(/(^|[^A-Z0-9])(USDT|USDC|CAKE|WBNB|BNB)([^A-Z0-9]|$)/);
+  return match?.[2] ?? null;
+}
+
+function normalizeBscTransferTokenSymbol(value) {
+  const token = stringOrEmpty(value).toUpperCase().trim();
+  if (!token) return null;
+  if (token === "BEP20USDT" || token === "BSC-USDT") return "USDT";
+  if (token === "BEP20USDC" || token === "BSC-USDC") return "USDC";
+  return token;
+}
+
+function extractTokenAmount(value, tokenSymbol) {
+  const token = tokenSymbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const text = stringOrEmpty(value);
+  const beforeToken = text.match(new RegExp(`([0-9]+(?:\\.[0-9]+)?)\\s*${token}`, "i"))?.[1];
+  if (beforeToken) return beforeToken;
+  const afterToken = text.match(new RegExp(`${token}\\s*([0-9]+(?:\\.[0-9]+)?)`, "i"))?.[1];
+  if (afterToken) return afterToken;
+  return null;
+}
+
+function extractAnyTransferAmount(value) {
+  const match = stringOrEmpty(value).match(/([0-9]+(?:\.[0-9]+)?)/);
+  return match?.[1] ?? null;
+}
+
+function normalizeServerEvmAddress(value, label) {
+  const text = stringOrEmpty(value).trim();
+  if (!/^0x[a-fA-F0-9]{40}$/.test(text)) {
+    throw new Error(`${label} must be a full 0x EVM address.`);
+  }
+  return text;
+}
+
+function normalizeOptionalServerEvmAddress(value) {
+  const text = stringOrEmpty(value).trim();
+  return /^0x[a-fA-F0-9]{40}$/.test(text) ? text : null;
+}
+
+function isBscLikeChain(value) {
+  const text = stringOrEmpty(value).toLowerCase();
+  return text === "56" || /bnb|bsc|binance/.test(text);
+}
+
+function addServerGasBuffer(gasEstimate) {
+  return (gasEstimate * 120n) / 100n;
+}
+
+async function readServerBep20Balance(input) {
+  const data = `0x70a08231${encodeServerAddress(input.address)}`;
+  const result = await serverEthereumRpc("eth_call", [{ data, to: input.tokenAddress }, "latest"], "56");
+  return BigInt(result);
+}
+
+function encodeServerErc20TransferData(toAddress, amount) {
+  return `0xa9059cbb${encodeServerAddress(toAddress)}${encodeServerUint(amount)}`;
+}
+
+function encodeServerAddress(address) {
+  return normalizeServerEvmAddress(address, "address").slice(2).toLowerCase().padStart(64, "0");
 }
 
 function createServerBscDappIntent(input) {
@@ -2788,8 +3339,10 @@ function buildSystemPrompt(enabledSkills) {
     "Schema:",
     "For PancakeSwap BNB Chain swaps, use action type swap with chain BNB Smart Chain, amount as the BNB input amount, token as the output token only, and params.slippageBps as a number.",
     "For BNB to USDC, token must be USDC. For BNB to USDT, token must be USDT. For BNB to CAKE, token must be CAKE.",
+    "For direct transfers, never create a transfer intent unless a deterministic server handler already prepared a complete evmTx with nonce, gas, value, and calldata. If transfer details are missing, return intent:null and ask for the exact chain, token, amount, and recipient.",
     "For Puffer staking, do not invent APY, balances, rates, calldata, gas, or nonce. If live prepared transaction data was not supplied by the app, explain that the Puffer mini app must prepare the review first and return intent:null.",
     "For Bitrefill commerce, do not invent products, prices, payment addresses, invoices, redemption codes, or order status. If Bitrefill API data was not supplied by the app, explain that Bitrefill credentials/search are required and return intent:null.",
+    "For RENAISS card purchase or listing, never create a dapp_request or authorization intent. The server has deterministic RENAISS handlers for SIWE login, funding, Permit2, buyNow, and listing. If the deterministic handler did not provide data, return intent:null and explain what exact RENAISS data is missing.",
     "{\"message\":\"string\",\"intent\":null|{\"title\":\"string\",\"summary\":\"string\",\"riskLevel\":\"info|warning|danger|block\",\"actions\":[{\"type\":\"sign_message|transfer|dapp_request|swap\",\"chain\":null|string,\"to\":null|string,\"token\":null|string,\"amount\":null|string,\"message\":null|string,\"data\":null|string,\"dappUrl\":null|string,\"params\":null|object}],\"safetyChecks\":[\"string\"]}}",
     `Enabled skills: ${JSON.stringify(enabledSkills)}`,
   ].join("\n");
@@ -3091,6 +3644,113 @@ function hasRecentRenaissContext(messages) {
   });
 }
 
+async function classifyRenaissChatRoute({ enabledSkills, lastUserMessage, messages }) {
+  if (!shouldClassifyRenaissChat(lastUserMessage, messages)) return null;
+
+  const apiKey = process.env.MINIMAX_API_KEY;
+  if (!apiKey) return null;
+
+  const model = process.env.MINIMAX_MODEL ?? "MiniMax-M2.7";
+  const baseUrl = process.env.MINIMAX_BASE_URL ?? "https://api.minimax.io/v1";
+  const minimaxResponse = await fetch(`${baseUrl}/chat/completions`, {
+    body: JSON.stringify({
+      messages: [
+        {
+          content: [
+            "你是錢包 agent 的安全路由分類器，只負責判斷使用者下一步想進入哪一個 RENAISS 流程。",
+            "不要回答使用者，不要產生 wallet intent，不要產生交易 payload，不要補資料。",
+            "只允許回傳 strict JSON：{\"intent\":\"listing|purchase|recommendation|none\",\"confidence\":0,\"reason\":\"string\"}",
+            "listing = 使用者要在 RENAISS 掛單、上架、出售、賣卡、設定 ask price。",
+            "purchase = 使用者要買入先前推薦或分析過的 RENAISS 卡，或對購買流程做短確認。",
+            "recommendation = 使用者要 RENAISS 特價卡、卡牌推薦、價格分析、警報或撿漏列表。",
+            "none = Bitrefill、Puffer、swap、Venus、Lista、一般聊天、或不是 RENAISS。",
+            "掛單/上架/出售/賣，永遠優先分類為 listing，不要分類成 purchase。",
+            "買/購買/幫我買這張，只有在訊息或最近上下文有 RENAISS 卡片時才分類為 purchase。",
+            "如果不確定，intent 用 none，confidence 低於 50。",
+          ].join("\n"),
+          role: "system",
+        },
+        {
+          content: JSON.stringify({
+            enabledSkills: enabledSkills.map((skill) => ({
+              name: skill.name,
+              policySummary: skill.policySummary,
+              trigger: skill.trigger,
+            })),
+            lastUserMessage: stringOrEmpty(lastUserMessage).slice(0, 500),
+            recentMessages: messages.slice(-8).map((message) => ({
+              content: stringOrEmpty(message.content).slice(0, 900),
+              role: message.role,
+            })),
+            recentRenaissPurchaseContext: findLatestRenaissPurchaseContext(messages),
+          }),
+          role: "user",
+        },
+      ],
+      model,
+      response_format: { type: "json_object" },
+      temperature: 0,
+    }),
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+
+  let data;
+  try {
+    data = await minimaxResponse.json();
+  } catch {
+    data = null;
+  }
+  if (!minimaxResponse.ok) {
+    throw new Error(data?.error?.message ?? data?.base_resp?.status_msg ?? "MiniMax RENAISS route classification failed.");
+  }
+
+  const rawContent = data?.choices?.[0]?.message?.content;
+  if (typeof rawContent !== "string" || rawContent.length === 0) {
+    throw new Error("MiniMax RENAISS route classification did not include assistant content.");
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(extractFirstJsonObject(rawContent));
+  } catch {
+    throw new Error("MiniMax RENAISS route classification was not strict JSON.");
+  }
+
+  const intent = stringOrEmpty(parsed.intent).toLowerCase();
+  const confidence = nullableNumber(parsed.confidence, 0, 100) ?? 0;
+  if (!["listing", "purchase", "recommendation", "none"].includes(intent)) {
+    throw new Error("MiniMax RENAISS route classification returned an unknown intent.");
+  }
+  if (intent === "none" || confidence < 50) return null;
+  return {
+    confidence,
+    intent,
+    reason: stringOrEmpty(parsed.reason).slice(0, 240),
+  };
+}
+
+function shouldClassifyRenaissChat(lastUserMessage, messages) {
+  const text = stringOrEmpty(lastUserMessage).toLowerCase().trim();
+  if (!text) return false;
+  if (/bitrefill|gift card|giftcard|esim|top-?up|steam|uber|netflix|google play|doordash/.test(text)) return false;
+  if (/pancakeswap|pancake|swap|puffer|venus|lista|staking|lend|borrow|質押|质押|借貸|借贷/.test(text)) return false;
+
+  if (/renaiss|renaiss\.xyz|snkrdunk|pricecharting|pokemon|psa\s*10|卡牌|卡片|特價|特价|警報|警报|低價|低价|撿漏|捡漏|價差|价差/.test(text)) {
+    return true;
+  }
+  if (/掛單|挂单|上架|出售|賣|卖|list\b|listing\b|sell\b|ask\s*price|askprice|開價|开价/.test(text)) {
+    return true;
+  }
+  if (hasRecentRenaissContext(messages) && /買|买|購買|购买|要|好|確認|确认|可以|推薦|推荐|分析/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
 function isRenaissRecommendationRequest(value) {
   const text = stringOrEmpty(value).toLowerCase();
   if (/bitrefill|gift card|giftcard|esim|top-?up/.test(text)) return false;
@@ -3111,6 +3771,11 @@ function isGenericPurchaseRequest(value) {
   if (/pancakeswap|pancake|swap|puffer|venus|lista|staking|lend|borrow|質押|质押|借貸|借贷/.test(text)) return false;
   if (isRenaissListingRequest(value)) return false;
   return /我要買|我要买|想買|想买|購買|购买|買一下|买一下|buy\b|purchase\b/.test(text);
+}
+
+function isRenaissShortPurchaseConfirmation(value) {
+  const text = stringOrEmpty(value).trim().toLowerCase();
+  return /^(要|好|確認|确认|可以|買|买|買了|买了|買這個|买这个|要買|要买)$/.test(text);
 }
 
 function findLatestRenaissPurchaseContext(messages) {
@@ -3153,8 +3818,11 @@ function sanitizeRenaissPurchaseContext(value) {
 
 function isRenaissListingRequest(value) {
   const text = stringOrEmpty(value).toLowerCase();
-  if (!/renaiss|renaiss\.xyz|卡牌|卡片|tokenid|token id/.test(text)) return false;
-  return /掛單|挂单|上架|出售|賣|卖|list\b|listing\b|sell\b|ask\s*price|askprice|開價|开价/.test(text);
+  if (/bitrefill|gift card|giftcard|pancake|puffer|venus|lista/.test(text)) return false;
+  const hasListingVerb = /掛單|挂单|上架|出售|賣|卖|list\b|listing\b|sell\b|ask\s*price|askprice|開價|开价/.test(text);
+  if (!hasListingVerb) return false;
+  if (/renaiss|renaiss\.xyz|卡牌|卡片|tokenid|token id/.test(text)) return true;
+  return /^(我要|我想|我想要|幫我|帮我|可以|請|请)?\s*(掛單|挂单|上架|出售|賣|卖)/.test(text);
 }
 
 function extractRenaissListingDraft(value) {
@@ -3605,7 +4273,7 @@ async function readServerPufferPreviewDeposit(amountWei, pufferVault, chainId = 
 }
 
 async function serverEthereumRpc(method, params, chainId = "1") {
-  const upstream = await fetch(getServerEthereumRpcUrl(chainId), {
+  const upstream = await fetch(getServerEvmRpcUrl(chainId), {
     body: JSON.stringify({
       id: Date.now(),
       jsonrpc: "2.0",
@@ -3788,6 +4456,10 @@ function normalizeWalletIntent(value) {
     throw new Error("Wallet intent requested secrets or sessions and was blocked.");
   }
 
+  if (containsRenaissGeneratedIntent(joined, actions)) {
+    throw new Error("RENAISS wallet intents must be produced by the deterministic RENAISS flow, not MiniMax.");
+  }
+
   if (!actions.length) {
     throw new Error("Wallet intent must include at least one action.");
   }
@@ -3805,6 +4477,20 @@ function normalizeWalletIntent(value) {
     summary,
     title,
   };
+}
+
+function containsRenaissGeneratedIntent(joined, actions) {
+  if (!joined.includes("renaiss")) return false;
+  return actions.some((action) => {
+    if (action.type !== "dapp_request") return false;
+    const actionName = stringOrEmpty(action.params?.action).toLowerCase();
+    return (
+      actionName === "buy" ||
+      actionName.includes("renaiss") ||
+      stringOrEmpty(action.dappUrl).toLowerCase().includes("renaiss.xyz") ||
+      stringOrEmpty(action.message).toLowerCase().includes("renaiss")
+    );
+  });
 }
 
 function normalizeActions(value, context = "") {
@@ -4427,6 +5113,12 @@ function stringOrEmpty(value) {
 function nullableString(value) {
   const text = stringOrEmpty(value).trim();
   return text.length > 0 ? text.slice(0, 2000) : null;
+}
+
+function nullableFieldString(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "bigint") return value.toString();
+  return nullableString(value);
 }
 
 function normalizeHttpUrl(value) {

@@ -16,10 +16,17 @@ export type WalletToken = {
   symbol: string;
   balanceLabel: string;
   fiatValue: string;
-  change: number;
+  change: number | null;
   accent: string;
+  chain?: string;
+  chainId?: string;
+  explorerAddressUrl?: string;
   iconLabel: string;
+  isNative?: boolean;
+  isTestnet?: boolean;
+  rawBalance?: string;
   sparkline: number[];
+  tokenAddress?: string | null;
 };
 
 export type WalletSummary = {

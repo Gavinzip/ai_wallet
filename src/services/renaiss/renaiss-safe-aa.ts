@@ -13,9 +13,6 @@ import {
 import { entryPoint07Address } from "viem/account-abstraction";
 import { toAccount } from "viem/accounts";
 import { bsc } from "viem/chains";
-import { createSmartAccountClient } from "permissionless";
-import { toSafeSmartAccount } from "permissionless/accounts";
-import { createPimlicoClient } from "permissionless/clients/pimlico";
 
 import type {
   TokenCoreAgentWallet,
@@ -148,6 +145,12 @@ export async function signRenaissSafeTypedData(input: SignSafeTypedDataInput) {
 }
 
 async function createSafeContext(input: TokenCoreSafeInput) {
+  const [{ createSmartAccountClient }, { toSafeSmartAccount }, { createPimlicoClient }] =
+    await Promise.all([
+      import("permissionless"),
+      import("permissionless/accounts"),
+      import("permissionless/clients/pimlico"),
+    ]);
   const safeAddress = normalizeAddress(input.safeAddress, "safeAddress");
   const publicClient = createRenaissPublicClient();
   const safeDeployedBefore = await isSafeDeployed(publicClient, safeAddress);
