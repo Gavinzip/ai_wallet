@@ -55,11 +55,19 @@ type SignedMessageResult = {
   signature?: string;
 };
 
+declare global {
+  interface Window {
+    __imTokenTcxWasmModule?: TcxWasmModule;
+  }
+}
+
 const WEB_WALLET_CURRENT_SUB_KEY = "imtoken.webWallet.currentSub.v1";
 const WEB_WALLET_KEY_PREFIX = "imtoken.webWallet.v1";
 const WEB_DERIVATION_PATH = "m/44'/60'/0'/0/0";
-const TCX_WASM_MODULE_PATH = "/tcx_wasm.js";
 const TCX_WASM_BINARY_PATH = "/tcx_wasm_bg.wasm";
+const TCX_WASM_LOADER_PATH = "/tcx_wasm_loader.js";
+const TCX_WASM_READY_EVENT = "imtoken:tcx-wasm-ready";
+const TCX_WASM_LOADER_ID = "imtoken-tcx-wasm-loader";
 
 let tcxWasmPromise: Promise<TcxWasmModule> | null = null;
 let lastWalletSyncNotice: string | null = null;
@@ -527,17 +535,44 @@ async function loadTcxWasm() {
 
 async function importTcxWasmModule(): Promise<TcxWasmModule> {
   if (process.env.EXPO_OS === "web" && typeof window !== "undefined") {
-    const moduleUrl = new URL(TCX_WASM_MODULE_PATH, window.location.origin).toString();
-    return importBrowserModule<TcxWasmModule>(moduleUrl);
+    return importBrowserTcxWasmModule();
   }
   return import("@consenlabs/tcx-wasm");
 }
 
-function importBrowserModule<TModule>(moduleUrl: string): Promise<TModule> {
-  const dynamicImport = new Function("moduleUrl", "return import(moduleUrl)") as (
-    moduleUrl: string,
-  ) => Promise<TModule>;
-  return dynamicImport(moduleUrl);
+function importBrowserTcxWasmModule(): Promise<TcxWasmModule> {
+  const loadedModule = window.__imTokenTcxWasmModule;
+  if (loadedModule) return Promise.resolve(loadedModule);
+
+  return new Promise<TcxWasmModule>((resolve, reject) => {
+    const finish = () => {
+      const tcx = window.__imTokenTcxWasmModule;
+      if (tcx) {
+        window.removeEventListener(TCX_WASM_READY_EVENT, finish);
+        resolve(tcx);
+      }
+    };
+    window.addEventListener(TCX_WASM_READY_EVENT, finish);
+
+    const existing = document.getElementById(TCX_WASM_LOADER_ID) as HTMLScriptElement | null;
+    if (existing) {
+      existing.addEventListener("error", () => reject(new Error("tcx-wasm loader failed to load.")), {
+        once: true,
+      });
+      finish();
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.id = TCX_WASM_LOADER_ID;
+    script.type = "module";
+    script.src = new URL(TCX_WASM_LOADER_PATH, window.location.origin).toString();
+    script.onerror = () => {
+      window.removeEventListener(TCX_WASM_READY_EVENT, finish);
+      reject(new Error("tcx-wasm loader failed to load."));
+    };
+    document.head.appendChild(script);
+  });
 }
 
 function deriveEvmAccount(
