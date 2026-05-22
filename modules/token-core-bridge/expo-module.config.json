@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android", "web"],
+  "apple": {
+    "modules": ["TokenCoreBridgeModule"]
+  },
+  "android": {
+    "modules": ["expo.modules.tokencorebridge.TokenCoreBridgeModule"]
+  }
+}

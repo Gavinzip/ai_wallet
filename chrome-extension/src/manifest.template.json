@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "imToken Agent Wallet",
+  "description": "Capture web pages for wallet-agent review without exposing cookies, sessions, or private keys.",
+  "version": "0.1.0",
+  __EXTENSION_KEY_BLOCK__
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": ["activeTab", "identity", "scripting", "storage", "tabs"],
+  "oauth2": {
+    "client_id": "__GOOGLE_CLIENT_ID__",
+    "scopes": ["openid", "email", "profile"]
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self';"
+  },
+  "web_accessible_resources": [
+    {
+      "matches": ["<all_urls>"],
+      "resources": ["tcx_wasm_bg.wasm"]
+    }
+  ]
+}

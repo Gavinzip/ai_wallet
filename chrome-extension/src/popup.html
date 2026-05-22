@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>imToken Agent Wallet</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div class="orb"></div>
+        <div>
+          <p class="eyebrow">Agent Wallet Companion</p>
+          <h1>imToken Agent</h1>
+          <p class="subcopy">Capture the active page for safe wallet review. Signing stays inside Token Core.</p>
+        </div>
+      </section>
+
+      <section class="status-grid">
+        <div class="status-card">
+          <span class="label">Google</span>
+          <strong id="googleStatus">Not signed in</strong>
+        </div>
+        <div class="status-card">
+          <span class="label">Token Core</span>
+          <strong id="wasmStatus">Not checked</strong>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="googleButton" type="button">Continue with Google</button>
+        <button id="captureButton" type="button">Capture active page</button>
+        <button id="tokenCoreButton" type="button">Verify Token Core WASM</button>
+      </section>
+
+      <section class="snapshot" id="snapshotCard" hidden>
+        <div>
+          <span class="label">Active page</span>
+          <strong id="pageTitle"></strong>
+          <p id="pageUrl"></p>
+        </div>
+        <button id="openAgentButton" type="button">Open agent review</button>
+      </section>
+
+      <p class="notice" id="notice"></p>
+    </main>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

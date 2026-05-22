@@ -1,0 +1,10 @@
+.DS_Store
+.env
+.expo
+.git
+.tmp
+chrome-extension/dist
+dist
+node_modules
+npm-debug.log*
+web-build

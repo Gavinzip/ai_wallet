@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "imToken Agent Wallet",
+    "slug": "imtoken-agent-wallet",
+    "scheme": "imtoken-agent-wallet",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.gavin.imtokenagentwallet"
+    },
+    "android": {
+      "package": "com.gavin.imtokenagentwallet"
+    },
+    "web": {
+      "bundler": "metro",
+      "output": "single"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-system-ui"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}
