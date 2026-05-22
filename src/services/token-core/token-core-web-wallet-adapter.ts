@@ -59,6 +59,7 @@ const WEB_WALLET_KEY_PREFIX = "imtoken.webWallet.v1";
 const WEB_DERIVATION_PATH = "m/44'/60'/0'/0/0";
 
 let tcxWasmPromise: Promise<TcxWasmModule> | null = null;
+let lastWalletSyncNotice: string | null = null;
 
 export class WebTokenCoreWasmAdapter {
   mode = "web-token-core" as const;
@@ -72,10 +73,18 @@ export class WebTokenCoreWasmAdapter {
   }
 
   async createAgentIdentityWallet(): Promise<TokenCoreAgentWallet> {
-    const user = loadStoredGoogleUser() ?? (await signInWithGoogleWeb());
+    lastWalletSyncNotice = null;
+    const { accessToken, user } = await getGoogleAccessTokenForServer({ prompt: "consent" });
     const existing = loadStoredWebWallet(user.sub);
     if (existing) {
-      const wallet = toTokenCoreAgentWallet(existing);
+      lastWalletSyncNotice = "Google account matched an existing local wallet. Passkey unlock keeps signing on this device.";
+      return toTokenCoreAgentWallet(existing);
+    }
+
+    const cloudBackup = await downloadWebTokenCoreCloudBackup(accessToken);
+    if (cloudBackup) {
+      const wallet = await restoreParsedWebTokenCoreWalletBackup(cloudBackup, user.sub);
+      lastWalletSyncNotice = "Google backup found. Restored the same Token Core wallet for this Google account.";
       return wallet;
     }
 
@@ -109,6 +118,12 @@ export class WebTokenCoreWasmAdapter {
       rpId: passkey.rpId,
     };
     storeWebWallet(stored);
+    try {
+      await uploadStoredWebTokenCoreCloudBackup(stored, accessToken, user);
+      lastWalletSyncNotice = "New Token Core wallet created and encrypted Google backup saved. This Google account can restore the same wallet on this domain.";
+    } catch (error) {
+      lastWalletSyncNotice = `New Token Core wallet created locally, but Google backup upload failed: ${formatErrorMessage(error)}. Use Save Google Backup before relying on browser storage.`;
+    }
     return toTokenCoreAgentWallet(stored);
   }
 
@@ -190,23 +205,11 @@ export async function exportWebTokenCoreWalletBackup() {
 
 export async function uploadWebTokenCoreCloudBackup() {
   const unlocked = await unlockStoredWebWallet();
-  const backup = buildWebWalletBackup(unlocked.stored);
   const { accessToken, user } = await getGoogleAccessTokenForServer();
   if (user.sub !== unlocked.stored.googleSub) {
     throw new Error("Google account changed. Sign in with the wallet owner account before uploading backup.");
   }
-  const response = await fetch(`${getAgentApiBaseUrl()}/api/wallet-backups/web`, {
-    body: JSON.stringify({ backup }),
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
-    },
-    method: "POST",
-  });
-  const payload = (await response.json().catch(() => ({}))) as CloudBackupPayload;
-  if (!response.ok) {
-    throw new Error(payload.error ?? `Cloud backup upload failed with HTTP ${response.status}.`);
-  }
+  const payload = await uploadStoredWebTokenCoreCloudBackup(unlocked.stored, accessToken, user);
   return {
     address: unlocked.wallet.address,
     savedAt: typeof payload.savedAt === "string" ? payload.savedAt : new Date().toISOString(),
@@ -218,17 +221,11 @@ export async function restoreWebTokenCoreCloudBackup(): Promise<TokenCoreAgentWa
     throw new Error("Web wallet cloud restore only runs in the browser.");
   }
   const { accessToken, user } = await getGoogleAccessTokenForServer();
-  const response = await fetch(`${getAgentApiBaseUrl()}/api/wallet-backups/web`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-    },
-    method: "GET",
-  });
-  const payload = (await response.json().catch(() => ({}))) as CloudBackupPayload;
-  if (!response.ok) {
-    throw new Error(payload.error ?? `Cloud backup restore failed with HTTP ${response.status}.`);
+  const backup = await downloadWebTokenCoreCloudBackup(accessToken);
+  if (!backup) {
+    throw new Error("No Google wallet backup exists for this account yet.");
   }
-  return restoreParsedWebTokenCoreWalletBackup(parseWebWalletBackupPayload(payload.backup), user.sub);
+  return restoreParsedWebTokenCoreWalletBackup(backup, user.sub);
 }
 
 export async function exportWebTokenCoreRecoveryPhrase() {
@@ -256,6 +253,53 @@ export async function restoreWebTokenCoreWalletBackup(rawJson: string): Promise<
   }
   const backup = parseWebWalletBackup(rawJson);
   return restoreParsedWebTokenCoreWalletBackup(backup);
+}
+
+export function takeWebTokenCoreWalletSyncNotice() {
+  const notice = lastWalletSyncNotice;
+  lastWalletSyncNotice = null;
+  return notice;
+}
+
+async function downloadWebTokenCoreCloudBackup(accessToken: string): Promise<WebWalletBackup | null> {
+  const response = await fetch(`${getAgentApiBaseUrl()}/api/wallet-backups/web`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+    method: "GET",
+  });
+  const payload = (await response.json().catch(() => ({}))) as CloudBackupPayload;
+  if (response.status === 404) {
+    return null;
+  }
+  if (!response.ok) {
+    throw new Error(payload.error ?? `Google wallet backup lookup failed with HTTP ${response.status}.`);
+  }
+  return parseWebWalletBackupPayload(payload.backup);
+}
+
+async function uploadStoredWebTokenCoreCloudBackup(
+  wallet: StoredWebWallet,
+  accessToken: string,
+  user: { email: string; sub: string },
+): Promise<CloudBackupPayload> {
+  if (user.sub !== wallet.googleSub) {
+    throw new Error("Google account changed. Sign in with the wallet owner account before uploading backup.");
+  }
+  const backup = buildWebWalletBackup(wallet);
+  const response = await fetch(`${getAgentApiBaseUrl()}/api/wallet-backups/web`, {
+    body: JSON.stringify({ backup }),
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+  const payload = (await response.json().catch(() => ({}))) as CloudBackupPayload;
+  if (!response.ok) {
+    throw new Error(payload.error ?? `Google wallet backup upload failed with HTTP ${response.status}.`);
+  }
+  return payload;
 }
 
 async function restoreParsedWebTokenCoreWalletBackup(
@@ -435,4 +479,8 @@ function toTokenCoreAgentWallet(wallet: StoredWebWallet): TokenCoreAgentWallet {
     label: "Google Passkey Wallet",
     source: "web-token-core",
   };
+}
+
+function formatErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
 }

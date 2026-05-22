@@ -35,7 +35,7 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
       const snapshot = await createOrUnlockTokenCoreWallet(trimmedPassword);
       onWalletLoaded(snapshot);
       setPassword("");
-      setStatus(`Wallet loaded: ${snapshot.summary.address}`);
+      setStatus(snapshot.setupNotice ?? `Wallet loaded: ${snapshot.summary.address}`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Could not create wallet.");
     } finally {
@@ -71,9 +71,9 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
       await restoreWebTokenCoreCloudBackup();
       const snapshot = await createOrUnlockTokenCoreWallet("");
       onWalletLoaded(snapshot);
-      setStatus(`Cloud backup restored: ${snapshot.summary.address}`);
+      setStatus(`Google wallet backup restored: ${snapshot.summary.address}`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not restore cloud backup.");
+      setStatus(error instanceof Error ? error.message : "Could not restore Google wallet backup.");
     } finally {
       setIsWorking(false);
     }
@@ -110,7 +110,7 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
           </Text>
           <Text style={{ color: colors.textMuted, fontSize: 13, lineHeight: 18 }}>
             {webMode
-              ? "Google identifies you; Passkey PRF encrypts the Token Core WASM wallet locally in this browser."
+              ? "Google finds your encrypted wallet backup; Passkey unlocks Token Core signing locally on this device."
               : "Creates or unlocks the local Agent Identity Wallet on this device."}
           </Text>
         </View>
@@ -182,7 +182,7 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
             </Text>
           </Pressable>
           <Pressable
-            accessibilityLabel="Restore web wallet from encrypted cloud backup"
+            accessibilityLabel="Restore web wallet from encrypted Google backup"
             accessibilityRole="button"
             disabled={disabled || isWorking}
             onPress={() => {
@@ -203,7 +203,7 @@ export function WalletSetupCard({ disabled, mode, onWalletLoaded }: WalletSetupC
           >
             <CloudDownload color={colors.blue} size={16} strokeWidth={2.4} />
             <Text style={{ color: colors.blue, fontSize: 14, fontWeight: "900" }}>
-              Restore Cloud Backup
+              Restore Google Wallet Backup
             </Text>
           </Pressable>
         </View>

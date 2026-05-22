@@ -2,6 +2,7 @@ import { emptyWalletName } from "@/data/wallet";
 import {
   getTokenCoreRuntimeStatus,
   getTokenCoreWalletAdapter,
+  takeWebTokenCoreWalletSyncNotice,
   type TokenCoreAgentWallet,
 } from "@/services/token-core/token-core-wallet-adapter";
 import type { WalletSummary, WalletToken } from "@/types/wallet";
@@ -10,6 +11,7 @@ export type WalletRuntimeSnapshot = {
   summary: WalletSummary;
   tokens: WalletToken[];
   canTransact: boolean;
+  setupNotice?: string;
 };
 
 export async function loadWalletRuntimeSnapshot(): Promise<WalletRuntimeSnapshot> {
@@ -76,7 +78,10 @@ export async function createOrUnlockTokenCoreWallet(password: string): Promise<W
 
   if (adapter.mode === "web-token-core") {
     const wallet = await adapter.createAgentIdentityWallet();
-    return createWalletRuntimeSnapshot(wallet);
+    return {
+      ...createWalletRuntimeSnapshot(wallet),
+      setupNotice: takeWebTokenCoreWalletSyncNotice() ?? undefined,
+    };
   }
 
   const trimmedPassword = password.trim();

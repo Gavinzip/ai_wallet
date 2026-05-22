@@ -70,11 +70,11 @@ export async function signInWithGoogleWeb(): Promise<GoogleWebUser> {
   return user;
 }
 
-export async function getGoogleAccessTokenForServer(): Promise<{
+export async function getGoogleAccessTokenForServer(input: { prompt?: string } = {}): Promise<{
   accessToken: string;
   user: GoogleWebUser;
 }> {
-  const accessToken = await requestGoogleAccessTokenWeb({ prompt: "" });
+  const accessToken = await requestGoogleAccessTokenWeb({ prompt: input.prompt ?? "" });
   const user = await fetchGoogleUser(accessToken);
   storeGoogleUser(user);
   return { accessToken, user };
@@ -87,7 +87,7 @@ export async function requestGoogleAccessTokenWeb(input: { prompt?: string } = {
 
   const clientId = await resolveGoogleClientId();
   if (!clientId) {
-    throw new Error("Set EXPO_PUBLIC_GOOGLE_CLIENT_ID or GOOGLE_CLIENT_ID on the agent server before using Google wallet login.");
+    throw new Error("Google wallet login is not configured. Set GOOGLE_CLIENT_ID on the deployed agent server, then redeploy/restart it.");
   }
 
   await loadGoogleIdentityScript();

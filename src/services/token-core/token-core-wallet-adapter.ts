@@ -11,6 +11,7 @@ import {
 } from "@/services/token-core/token-core-protobuf";
 import {
   isWebTokenCoreAvailable,
+  takeWebTokenCoreWalletSyncNotice,
   WebTokenCoreWasmAdapter,
 } from "@/services/token-core/token-core-web-wallet-adapter";
 
@@ -51,6 +52,8 @@ export type TokenCoreWalletAdapter = {
   signLoginChallenge: (input: SignIntentInput) => Promise<{ signature: string }>;
   buildTransferIntent: (input: TransferIntentInput) => Promise<{ txPayload: string }>;
 };
+
+export { takeWebTokenCoreWalletSyncNotice };
 
 type TcxNativeModule = {
   getDefaultFileDir?: () => string;

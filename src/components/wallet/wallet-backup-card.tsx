@@ -51,9 +51,9 @@ export function WalletBackupCard() {
     setRecoveryPhrase(null);
     try {
       const backup = await uploadWebTokenCoreCloudBackup();
-      setStatus(`Cloud backup saved for ${backup.address} at ${new Date(backup.savedAt).toLocaleString()}. Server stores only the encrypted keystore backup.`);
+      setStatus(`Google wallet backup saved for ${backup.address} at ${new Date(backup.savedAt).toLocaleString()}. Server stores only the encrypted keystore backup.`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not save cloud backup.");
+      setStatus(error instanceof Error ? error.message : "Could not save Google wallet backup.");
     } finally {
       setIsWorking(false);
     }
@@ -65,9 +65,9 @@ export function WalletBackupCard() {
     setRecoveryPhrase(null);
     try {
       const wallet = await restoreWebTokenCoreCloudBackup();
-      setStatus(`Cloud backup restored for ${wallet.address}. Refresh wallet state if the header has not updated yet.`);
+      setStatus(`Google wallet backup restored for ${wallet.address}. Refresh wallet state if the header has not updated yet.`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "Could not restore cloud backup.");
+      setStatus(error instanceof Error ? error.message : "Could not restore Google wallet backup.");
     } finally {
       setIsWorking(false);
     }
@@ -103,7 +103,7 @@ export function WalletBackupCard() {
             Wallet Backup
           </Text>
           <Text style={{ color: colors.textMuted, fontSize: 13, lineHeight: 18 }}>
-            Clearing browser storage can remove this web wallet. Export a backup before using real funds.
+            Google stores no private key. Your server stores only the encrypted wallet backup for this Google account.
           </Text>
         </View>
       </View>
@@ -120,7 +120,7 @@ export function WalletBackupCard() {
         <BackupButton
           disabled={isWorking}
           icon="cloud-upload"
-          label="Save Cloud"
+          label="Save Google Backup"
           onPress={() => {
             void uploadCloudBackup();
           }}
@@ -131,7 +131,7 @@ export function WalletBackupCard() {
         <BackupButton
           disabled={isWorking}
           icon="cloud-download"
-          label="Restore Cloud"
+          label="Restore Google Backup"
           onPress={() => {
             void restoreCloudBackup();
           }}
