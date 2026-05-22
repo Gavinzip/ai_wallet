@@ -41,13 +41,18 @@ export type RenaissPriceTrend = {
   compact_records?: RenaissPriceRecord[];
   direction: "uptrend" | "downtrend" | "flat" | "insufficient";
   earliest_date: string | null;
+  grade_filter?: string | null;
   latest_date: string | null;
   latest_price_usd: number | null;
   median_price_usd: number | null;
   normalized_count: number;
   recent_avg_usd: number | null;
+  recent_count?: number;
+  recent_end_date?: string | null;
+  recent_start_date?: string | null;
   records_total: number;
   trend_pct: number | null;
+  used_grade_filter?: boolean;
 };
 
 export type RenaissOpportunity = {

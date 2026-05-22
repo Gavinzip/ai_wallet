@@ -535,44 +535,23 @@ async function handleRenaissAiReview(request, response) {
 
 async function handleRenaissChatRecommendation(userMessage, response) {
   try {
-    const scanPayload = compactRenaissRequestPayload({
-      cache_ttl_seconds: 60,
-      force_refresh: false,
-      include_full_records: false,
-      keep_limit: 5,
-      limit: 5,
-      min_profit_usd: 0,
-      notify_wallet: false,
-      only_actionable: false,
-      reference_id: `agent-chat-${Date.now()}`,
-      scan_limit: 30,
-      threshold_percent: null,
-      use_cache: true,
-      wallet_budget_usd: null,
-    });
     let scanCacheNotice = null;
     let analysisNotice = null;
-    let scan = await readRenaissScanCache();
-    if (scan) {
-      scanCacheNotice = `先用背景整理好的推薦快取（${formatServerTime(scan.cache?.cachedAt)}）。`;
-    } else {
-      try {
-        scan = await fetchRemoteRenaissLatestOpportunities();
-        scanCacheNotice = `使用 RENAISS API 最新快取（${formatServerTime(scan.cache?.cachedAt ?? scan.time_utc)}）。`;
-      } catch (scanError) {
-        try {
-          scan = await fetchRenaissJson("/v1/opportunities/scan", {
-            body: scanPayload,
-            method: "POST",
-            timeoutMs: 45_000,
-          });
-        } catch (refreshError) {
-          const cached = await readRenaissScanCache();
-          if (!cached?.opportunities?.length) throw refreshError;
-          scan = cached;
-          scanCacheNotice = `遠端掃描暫時失敗，先用最近一次成功快取（原因：${formatErrorMessage(refreshError)}）。`;
-        }
-      }
+    let scan;
+    try {
+      scan = await fetchRemoteRenaissLatestOpportunities();
+      const responsePayload = withRenaissCacheMeta(scan, normalizeRenaissCacheMeta(scan, {
+        cachedAt: scan?.time_utc ?? new Date().toISOString(),
+        status: "cached",
+      }));
+      await writeRenaissScanCache(responsePayload);
+      scan = responsePayload;
+      scanCacheNotice = `使用 RENAISS monitor 自動更新快取（${formatServerTime(scan.cache?.cachedAt ?? scan.time_utc)}）。`;
+    } catch (scanError) {
+      const cached = await readRenaissScanCache();
+      if (!cached?.opportunities?.length) throw scanError;
+      scan = cached;
+      scanCacheNotice = `遠端最新快取暫時不可用，先用錢包伺服器保存的最近快取（原因：${formatErrorMessage(scanError)}）。`;
     }
     const opportunities = Array.isArray(scan?.opportunities) ? scan.opportunities : [];
     if (isRenaissCardListRequest(userMessage)) {
@@ -970,6 +949,9 @@ async function createRenaissAiReview(input) {
             "你是自託管錢包裡的謹慎卡牌交易分析員。",
             "所有輸出欄位都必須使用繁體中文，除非是卡名、來源名稱、幣別、網址或數字。",
             "只使用提供的 RENAISS monitor 事實、完整 normalized price-record 趨勢、卡名與來源資料。不要編造價格、流動性、稀有度、持有者或未提供的市場資訊。",
+            "價格名詞必須精準：sources.*.avg_price_usd 只能叫「摘要參考均價」；trend.recent_avg_usd 只能叫「近期成交均價」；trend.latest_price_usd 只能叫「最新成交價」。不要使用「均價」單獨指代任何數字。",
+            "只要提到近期成交均價或最新成交價，必須寫出 trend.recent_start_date / trend.recent_end_date 或 latest_date 的時間區間；如果沒有日期就明確說日期不足。",
+            "如果摘要參考均價與近期成交均價差很多，必須直接說這是全期/摘要均價與近期成交窗口不同造成，不可以讓它看起來像矛盾。",
             "只有 action 是 BUY_CANDIDATE 或利潤/價差清楚為正，且走勢沒有明顯反駁時，才可以給 buy_candidate。",
             "如果價格高於參考市場、資料品質弱、跨市場差異太大或趨勢證據不足，請給 watch 或 avoid，並用短句講清楚。",
             "每個文字欄位都要短、可掃讀，不要長篇大論。reasons/riskFlags 每點最多 32 個中文字左右。",
@@ -984,6 +966,7 @@ async function createRenaissAiReview(input) {
           content: JSON.stringify({
             analysis,
             opportunity,
+            priceContext: buildRenaissPriceContext(rawAnalysis ?? rawOpportunity),
             trendContext,
             userMessage: stringOrEmpty(input.userMessage).slice(0, 500),
           }),
@@ -2468,7 +2451,7 @@ function formatRenaissOpportunityList(items) {
     lines.push(
       [
         `Ask $${formatServerMoney(item.ask_price_usd)}`,
-        bestSource ? `參考 ${bestSource.label} 均價 $${formatServerMoney(bestSource.avg_price_usd)}` : "參考均價不足",
+        bestSource ? `參考 ${bestSource.label} 摘要均價 $${formatServerMoney(bestSource.avg_price_usd)}` : "參考摘要均價不足",
         item.estimated_diff_pct === null ? "價差不足" : `價差 ${item.estimated_diff_pct.toFixed(1)}%`,
         item.estimated_profit_usd === null
           ? "預估損益不足"
@@ -2503,7 +2486,7 @@ function formatRenaissSourcesBrief(item) {
       if (!source?.avg_price_usd) return null;
       const diff = source.diff_pct === null ? "價差不足" : `${source.diff_pct.toFixed(1)}%`;
       const samples = Number(source.records_total || source.sample_count || 0);
-      return `${label} avg $${formatServerMoney(source.avg_price_usd)} / ${diff}${samples ? ` / ${samples} 筆` : ""}`;
+      return `${label} 摘要均價 $${formatServerMoney(source.avg_price_usd)} / ${diff}${samples ? ` / ${samples} 筆` : ""}`;
     })
     .filter(Boolean);
   return parts.length ? parts.join("；") : "來源均價不足";
@@ -3097,6 +3080,7 @@ function sanitizeRenaissOpportunity(value) {
   }
 
   const source = value.sources && typeof value.sources === "object" ? value.sources : {};
+  const targetGrade = inferRenaissTargetGrade(value);
   return {
     action: stringOrEmpty(value.action).slice(0, 40),
     actionable: Boolean(value.actionable),
@@ -3111,8 +3095,8 @@ function sanitizeRenaissOpportunity(value) {
     name: stringOrEmpty(value.name).slice(0, 500),
     renaiss_url: nullableString(value.renaiss_url),
     sources: {
-      pricecharting: sanitizeRenaissSource(source.pricecharting),
-      snkrdunk: sanitizeRenaissSource(source.snkrdunk),
+      pricecharting: sanitizeRenaissSource(source.pricecharting, targetGrade),
+      snkrdunk: sanitizeRenaissSource(source.snkrdunk, targetGrade),
     },
   };
 }
@@ -3128,7 +3112,7 @@ function sanitizeRenaissAnalysisResponse(value, fallbackOpportunity) {
   };
 }
 
-function sanitizeRenaissSource(value) {
+function sanitizeRenaissSource(value, targetGrade = null) {
   if (!value || typeof value !== "object") {
     return {
       avg_price_usd: null,
@@ -3141,7 +3125,7 @@ function sanitizeRenaissSource(value) {
     };
   }
 
-  const trend = buildRenaissSourceTrend(value);
+  const trend = buildRenaissSourceTrend(value, targetGrade);
   return {
     avg_price_usd: nullableNumber(value.avg_price_usd, 0, 10_000_000),
     diff_pct: nullableNumber(value.diff_pct, -10_000, 10_000),
@@ -3155,15 +3139,55 @@ function sanitizeRenaissSource(value) {
 
 function buildRenaissTrendContext(value) {
   const source = value?.sources && typeof value.sources === "object" ? value.sources : {};
+  const targetGrade = inferRenaissTargetGrade(value);
   return {
-    pricecharting: buildRenaissSourceTrend(source.pricecharting),
-    snkrdunk: buildRenaissSourceTrend(source.snkrdunk),
+    pricecharting: buildRenaissSourceTrend(source.pricecharting, targetGrade),
+    snkrdunk: buildRenaissSourceTrend(source.snkrdunk, targetGrade),
   };
 }
 
-function buildRenaissSourceTrend(source) {
+function buildRenaissPriceContext(value) {
+  const opportunity = sanitizeRenaissOpportunity(value);
+  const sources = opportunity.sources ?? {};
+  return {
+    ask_price_usd: opportunity.ask_price_usd ?? null,
+    best_market: opportunity.best_market ?? null,
+    grade: opportunity.grade ?? null,
+    sources: {
+      pricecharting: buildRenaissPriceSourceContext(sources.pricecharting),
+      snkrdunk: buildRenaissPriceSourceContext(sources.snkrdunk),
+    },
+  };
+}
+
+function buildRenaissPriceSourceContext(source) {
+  return {
+    diff_pct: source?.diff_pct ?? null,
+    latest_date: source?.trend?.latest_date ?? null,
+    latest_price_usd: source?.trend?.latest_price_usd ?? null,
+    recent_avg_usd: source?.trend?.recent_avg_usd ?? null,
+    recent_count: source?.trend?.recent_count ?? 0,
+    recent_end_date: source?.trend?.recent_end_date ?? null,
+    recent_start_date: source?.trend?.recent_start_date ?? null,
+    sample_count: source?.sample_count ?? 0,
+    summary_avg_price_usd: source?.avg_price_usd ?? null,
+    trend_direction: source?.trend?.direction ?? "insufficient",
+    trend_pct: source?.trend?.trend_pct ?? null,
+    used_grade_filter: source?.trend?.used_grade_filter ?? false,
+  };
+}
+
+function buildRenaissSourceTrend(source, targetGrade = null) {
   const records = normalizeRenaissPriceRecords(source?.records_normalized);
-  const pricedRecords = records
+  const targetGradeKey = normalizeRenaissGrade(targetGrade);
+  const gradeMatchedRecords = targetGradeKey
+    ? records.filter((record) => normalizeRenaissGrade(record.grade) === targetGradeKey)
+    : [];
+  const trendRecords = gradeMatchedRecords.some((record) => record.price_usd !== null)
+    ? gradeMatchedRecords
+    : records;
+  const usedGradeFilter = trendRecords === gradeMatchedRecords && gradeMatchedRecords.length > 0;
+  const pricedRecords = trendRecords
     .filter((record) => record.price_usd !== null)
     .sort((left, right) => {
       const leftTime = dateTimeOrZero(left.date_iso);
@@ -3178,18 +3202,24 @@ function buildRenaissSourceTrend(source) {
       compact_records: pricedRecords.slice(-20),
       direction: "insufficient",
       earliest_date: pricedRecords[0]?.date_iso ?? null,
+      grade_filter: usedGradeFilter ? targetGradeKey : null,
       latest_date: pricedRecords.at(-1)?.date_iso ?? null,
       latest_price_usd: pricedRecords.at(-1)?.price_usd ?? null,
       median_price_usd: median(prices),
       normalized_count: pricedRecords.length,
       recent_avg_usd: average(prices),
+      recent_count: pricedRecords.length,
+      recent_end_date: pricedRecords.at(-1)?.date_iso ?? null,
+      recent_start_date: pricedRecords[0]?.date_iso ?? null,
       records_total: recordsTotal,
       trend_pct: null,
+      used_grade_filter: usedGradeFilter,
     };
   }
 
   const windowSize = Math.min(12, Math.max(3, Math.ceil(prices.length * 0.2)));
   const recentPrices = prices.slice(-windowSize);
+  const recentRecords = pricedRecords.slice(-windowSize);
   const previousPrices = prices.slice(Math.max(0, prices.length - windowSize * 2), prices.length - windowSize);
   const recentAvg = average(recentPrices);
   const previousAvg = previousPrices.length > 0 ? average(previousPrices) : prices[0];
@@ -3205,14 +3235,40 @@ function buildRenaissSourceTrend(source) {
     compact_records: pricedRecords.slice(-80),
     direction,
     earliest_date: pricedRecords[0]?.date_iso ?? null,
+    grade_filter: usedGradeFilter ? targetGradeKey : null,
     latest_date: pricedRecords.at(-1)?.date_iso ?? null,
     latest_price_usd: pricedRecords.at(-1)?.price_usd ?? null,
     median_price_usd: median(prices),
     normalized_count: pricedRecords.length,
     recent_avg_usd: recentAvg,
+    recent_count: recentRecords.length,
+    recent_end_date: recentRecords.at(-1)?.date_iso ?? null,
+    recent_start_date: recentRecords[0]?.date_iso ?? null,
     records_total: recordsTotal,
     trend_pct: trendPct,
+    used_grade_filter: usedGradeFilter,
   };
+}
+
+function inferRenaissTargetGrade(value) {
+  const explicitGrade = nullableString(value?.grade);
+  if (explicitGrade) return explicitGrade;
+  const name = stringOrEmpty(value?.name);
+  const psa = name.match(/PSA\s*([0-9]{1,2})/i);
+  if (psa) return `PSA ${psa[1]}`;
+  const bgs = name.match(/BGS\s*([0-9](?:\.[0-9])?)/i);
+  if (bgs) return `BGS ${bgs[1]}`;
+  return null;
+}
+
+function normalizeRenaissGrade(value) {
+  const raw = stringOrEmpty(value).toUpperCase();
+  const psa = raw.match(/PSA\s*([0-9]{1,2})/);
+  if (psa) return `PSA ${psa[1]}`;
+  const bgs = raw.match(/BGS\s*([0-9](?:\.[0-9])?)/);
+  if (bgs) return `BGS ${bgs[1]}`;
+  if (raw.includes("UNGRADED")) return "UNGRADED";
+  return raw.replace(/[^A-Z0-9.]+/g, " ").trim();
 }
 
 function normalizeRenaissPriceRecords(value) {

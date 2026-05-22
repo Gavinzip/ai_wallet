@@ -1,3 +1,4 @@
+import { appendWalletActivityRecord } from "@/services/activity/wallet-activity-log";
 import { BSC_EXPLORER_TX_URL, sendBscRawTransaction } from "@/services/defi/bsc-rpc";
 import {
   getEvmExplorerTxUrl,
@@ -44,6 +45,19 @@ export async function requestLocalTokenCoreSigning(
     const explorerUrl = isSupportedEthereumChain(action.chain)
       ? getEvmExplorerTxUrl(action.chain, txHash)
       : `${BSC_EXPLORER_TX_URL}${txHash}`;
+    appendWalletActivityRecord({
+      amount: action.amount,
+      chain: action.chain,
+      detail: `Sent ${action.amount} ${action.token} to ${shortAddress(action.to)}.`,
+      explorerUrl,
+      kind: "transaction",
+      source: "token-core",
+      status: "submitted",
+      title: `${action.token} transfer submitted`,
+      to: action.to,
+      token: action.token,
+      txHash,
+    });
 
     return {
       explorerUrl,
@@ -87,6 +101,24 @@ export async function requestLocalTokenCoreSigning(
         ? action.params.amountOutMin
         : prepared?.quote.amountOutMin;
     const outputSymbol = normalizeOutputSymbol(action.token);
+    appendWalletActivityRecord({
+      amount: action.amount,
+      chain: "BNB Smart Chain",
+      detail: [
+        `Swapped ${action.amount} BNB to ${outputSymbol} on PancakeSwap.`,
+        amountOutMin ? `Minimum receive ${amountOutMin} ${outputSymbol}.` : null,
+      ]
+        .filter(Boolean)
+        .join(" "),
+      explorerUrl: `${BSC_EXPLORER_TX_URL}${txHash}`,
+      kind: "transaction",
+      source: "token-core",
+      status: "submitted",
+      title: `PancakeSwap ${outputSymbol} swap submitted`,
+      to: action.to ?? evmTx.to,
+      token: `BNB -> ${outputSymbol}`,
+      txHash,
+    });
 
     return {
       explorerUrl: `${BSC_EXPLORER_TX_URL}${txHash}`,
@@ -114,6 +146,14 @@ export async function requestLocalTokenCoreSigning(
       statement: action.message,
       walletId: "local-token-core-wallet",
     });
+    appendWalletActivityRecord({
+      chain: action.chain,
+      detail: intent.title,
+      kind: "message_signature",
+      source: "token-core",
+      status: "signed",
+      title: "Message signed locally",
+    });
 
     return {
       message: "Token Core produced a local signature.",
@@ -123,6 +163,11 @@ export async function requestLocalTokenCoreSigning(
   }
 
   throw new Error("DApp requests must be decoded into a concrete signing action before Token Core can sign.");
+}
+
+function shortAddress(value: string) {
+  if (value.length <= 12) return value;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
 
 function validateIntentSecurityBoundary(intent: WalletIntent) {

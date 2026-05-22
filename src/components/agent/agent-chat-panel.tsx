@@ -526,7 +526,7 @@ function RenaissRecommendationCard({
   const bestSource = getBestSource(item);
   const profit = getProfitMeta(item);
   const marketLabel = bestSource.label;
-  const averageLabel = bestSource.avgPrice === null ? "無參考均價" : `$${formatMoney(bestSource.avgPrice)}`;
+  const averageLabel = bestSource.avgPrice === null ? "無摘要均價" : `$${formatMoney(bestSource.avgPrice)}`;
   const spreadLabel = item.estimated_diff_pct === null ? "無價差" : `${item.estimated_diff_pct.toFixed(1)}%`;
 
   return (
@@ -596,7 +596,7 @@ function RenaissRecommendationCard({
 
       <View style={{ gap: 6 }}>
         <MetricLine label="目前掛牌" value={`$${formatMoney(item.ask_price_usd)}`} />
-        <MetricLine label={`${marketLabel} 均價`} value={averageLabel} />
+        <MetricLine label={`${marketLabel} 摘要均價`} value={averageLabel} />
         <MetricLine label="預估損益" tone={profit.tone} value={profit.value} />
         <MetricLine label="價差" tone={profit.tone} value={spreadLabel} />
       </View>

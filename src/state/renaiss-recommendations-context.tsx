@@ -14,7 +14,6 @@ import {
   fetchCachedRenaissOpportunities,
   fetchLatestRenaissOpportunities,
   reviewRenaissOpportunity,
-  scanRenaissOpportunities,
 } from "@/services/renaiss/renaiss-monitor-api";
 import type {
   RenaissAiReviewResponse,
@@ -72,25 +71,16 @@ export function RenaissRecommendationsProvider({ children }: PropsWithChildren) 
       const latest = await fetchLatestRenaissOpportunities().catch(() => null);
       if (latest?.opportunities.length) {
         setScan(latest);
-        if (!options.force) return latest;
+        return latest;
       }
 
-      const response = await scanRenaissOpportunities({
-        cache_ttl_seconds: 60,
-        force_refresh: Boolean(options.force),
-        include_full_records: false,
-        keep_limit: 5,
-        limit: 5,
-        min_profit_usd: 0,
-        only_actionable: false,
-        reference_id: `${options.reason ?? "wallet-background"}-${now}`,
-        scan_limit: 30,
-        threshold_percent: null,
-        use_cache: !options.force,
-        wallet_budget_usd: null,
-      });
-      setScan(response);
-      return response;
+      const cached = await fetchCachedRenaissOpportunities();
+      if (cached?.opportunities.length) {
+        setScan(cached);
+        return cached;
+      }
+
+      throw new Error("RENAISS monitor has no cached opportunities yet. Wait for the remote auto-refresh job to finish.");
     })();
     scanInFlightRef.current = task;
     setIsScanning(true);

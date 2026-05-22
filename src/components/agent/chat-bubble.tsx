@@ -3,7 +3,11 @@ import { Image, Linking, Pressable, Text, View } from "react-native";
 
 import { colors, radii } from "@/theme/tokens";
 import type { AgentMessage, RenaissAnalysisMessage } from "@/types/agent";
-import type { RenaissAiReviewResponse } from "@/types/renaiss-monitor";
+import type {
+  RenaissAiReviewResponse,
+  RenaissOpportunity,
+  RenaissSourceSignal,
+} from "@/types/renaiss-monitor";
 
 type ChatBubbleProps = {
   message: AgentMessage;
@@ -68,6 +72,7 @@ function RenaissAnalysisCard({
 }) {
   const { item, review } = payload;
   const verdict = getVerdictMeta(review.verdict);
+  const trend = getTrendMeta(item, review.trendSummary);
   const priceChartingUrl = item.sources.pricecharting.url;
   const snkrdunkUrl = item.sources.snkrdunk.url;
 
@@ -120,9 +125,9 @@ function RenaissAnalysisCard({
                 paddingVertical: 6,
               }}
             >
-              {getTrendIcon(review.trendSummary)}
+              {trend.icon}
               <Text style={{ color: colors.textMuted, fontSize: 12, fontWeight: "900" }}>
-                {getTrendLabel(review.trendSummary)}
+                {trend.label}
               </Text>
             </View>
           </View>
@@ -138,6 +143,7 @@ function RenaissAnalysisCard({
         </View>
       </View>
 
+      <PriceEvidenceBlock item={item} />
       <InfoBlock title="價格重點" value={review.priceSummary} />
       <InfoBlock title="走勢判斷" value={review.trendSummary} />
       <InfoList title="我看到的重點" values={review.reasons.slice(0, 3)} />
@@ -251,6 +257,47 @@ function InfoList({
   );
 }
 
+function PriceEvidenceBlock({ item }: { item: RenaissOpportunity }) {
+  const rows = getPriceEvidenceRows(item);
+  if (rows.length === 0) return null;
+
+  return (
+    <View style={{ gap: 8 }}>
+      <Text style={{ color: colors.text, fontSize: 13, fontWeight: "900" }}>
+        價格基準
+      </Text>
+      <View style={{ gap: 7 }}>
+        {rows.map((row) => (
+          <View
+            key={row.label}
+            style={{
+              backgroundColor: colors.surfaceMuted,
+              borderRadius: 16,
+              gap: 5,
+              padding: 10,
+            }}
+          >
+            <Text style={{ color: colors.text, fontSize: 13, fontWeight: "900" }}>
+              {row.label}
+            </Text>
+            <MetricText label="摘要參考均價" value={row.summaryAverage} />
+            <MetricText label="近期成交均價" value={row.recentAverage} />
+            <MetricText label="最新成交價" value={row.latestPrice} />
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+function MetricText({ label, value }: { label: string; value: string }) {
+  return (
+    <Text style={{ color: colors.textMuted, fontSize: 12, fontWeight: "800", lineHeight: 17 }}>
+      {label}：{value}
+    </Text>
+  );
+}
+
 function LinkChip({ label, url }: { label: string; url?: string | null }) {
   if (!url) return null;
   return (
@@ -288,28 +335,102 @@ function getVerdictMeta(verdict: RenaissAiReviewResponse["verdict"]) {
   return { background: colors.amberSoft, label: "觀望", text: "#9B5C00" };
 }
 
-function getTrendIcon(summary: string) {
+function getTrendMeta(item: RenaissOpportunity, summary: string) {
+  const source = getPreferredSource(item);
+  const direction = source?.trend?.direction;
+  if (direction === "downtrend") {
+    return { icon: <TrendingDown color={colors.red} size={13} strokeWidth={2.4} />, label: "走弱" };
+  }
+  if (direction === "uptrend") {
+    return { icon: <TrendingUp color="#08785F" size={13} strokeWidth={2.4} />, label: "走強" };
+  }
+  if (direction === "flat") {
+    return { icon: <Brain color={colors.textMuted} size={13} strokeWidth={2.4} />, label: "持平" };
+  }
+
   const lower = summary.toLowerCase();
   if (lower.includes("down") || summary.includes("下")) {
-    return <TrendingDown color={colors.red} size={13} strokeWidth={2.4} />;
+    return { icon: <TrendingDown color={colors.red} size={13} strokeWidth={2.4} />, label: "走弱" };
   }
   if (lower.includes("up") || summary.includes("上")) {
-    return <TrendingUp color="#08785F" size={13} strokeWidth={2.4} />;
+    return { icon: <TrendingUp color="#08785F" size={13} strokeWidth={2.4} />, label: "走強" };
   }
-  return <Brain color={colors.textMuted} size={13} strokeWidth={2.4} />;
+  return { icon: <Brain color={colors.textMuted} size={13} strokeWidth={2.4} />, label: "需觀察" };
 }
 
-function getTrendLabel(summary: string) {
-  const lower = summary.toLowerCase();
-  if (lower.includes("down") || summary.includes("下")) return "走弱";
-  if (lower.includes("up") || summary.includes("上")) return "走強";
-  return "需觀察";
+function getPriceEvidenceRows(item: RenaissOpportunity) {
+  const orderedKeys = orderSourceKeys(item);
+  return orderedKeys
+    .map((key) => {
+      const source = item.sources[key];
+      if (!source) return null;
+      const hasData = isFiniteNumber(source.avg_price_usd)
+        || isFiniteNumber(source.trend?.recent_avg_usd)
+        || isFiniteNumber(source.trend?.latest_price_usd);
+      if (!hasData) return null;
+      return {
+        label: key === "snkrdunk" ? "SNKRDUNK" : "PriceCharting",
+        latestPrice: formatLatestPrice(source),
+        recentAverage: formatRecentAverage(source),
+        summaryAverage: formatSummaryAverage(source),
+      };
+    })
+    .filter((row): row is { label: string; latestPrice: string; recentAverage: string; summaryAverage: string } => Boolean(row));
+}
+
+function orderSourceKeys(item: RenaissOpportunity): ("snkrdunk" | "pricecharting")[] {
+  const best = (item.best_market ?? "").toLowerCase().includes("snkr") ? "snkrdunk" : "pricecharting";
+  return best === "snkrdunk" ? ["snkrdunk", "pricecharting"] : ["pricecharting", "snkrdunk"];
+}
+
+function getPreferredSource(item: RenaissOpportunity): RenaissSourceSignal | null {
+  return item.sources[orderSourceKeys(item)[0]] ?? null;
+}
+
+function formatSummaryAverage(source: RenaissSourceSignal) {
+  if (!isFiniteNumber(source.avg_price_usd)) return "無摘要資料";
+  const samples = source.sample_count ? ` / 摘要樣本 ${source.sample_count} 筆` : "";
+  return `$${formatMoney(source.avg_price_usd)}${samples}`;
+}
+
+function formatRecentAverage(source: RenaissSourceSignal) {
+  const trend = source.trend;
+  if (!trend || !isFiniteNumber(trend.recent_avg_usd)) return "無近期成交資料";
+  const range = formatDateRange(trend.recent_start_date ?? trend.earliest_date, trend.recent_end_date ?? trend.latest_date);
+  const grade = trend.used_grade_filter && trend.grade_filter ? `${trend.grade_filter} / ` : "";
+  const count = trend.recent_count ? ` / ${trend.recent_count} 筆` : "";
+  return `$${formatMoney(trend.recent_avg_usd)}（${grade}${range}${count}）`;
+}
+
+function formatLatestPrice(source: RenaissSourceSignal) {
+  const trend = source.trend;
+  if (!trend || !isFiniteNumber(trend.latest_price_usd)) return "無最新成交資料";
+  const date = formatShortDate(trend.latest_date);
+  return `$${formatMoney(trend.latest_price_usd)}${date ? `（${date}）` : ""}`;
 }
 
 function formatOpportunityEdge(item: RenaissAnalysisMessage["item"]) {
   const diff = item.estimated_diff_pct === null ? "無明確價差" : `${item.estimated_diff_pct.toFixed(1)}%`;
   const profit = item.estimated_profit_usd === null ? "" : ` / 預估 $${formatMoney(item.estimated_profit_usd)}`;
   return `${item.best_market ?? "無市場均價"} / ${diff}${profit}`;
+}
+
+function formatDateRange(start?: string | null, end?: string | null) {
+  const startDate = formatShortDate(start);
+  const endDate = formatShortDate(end);
+  if (startDate && endDate) return `${startDate} - ${endDate}`;
+  return startDate || endDate || "日期不足";
+}
+
+function formatShortDate(value?: string | null) {
+  if (!value) return "";
+  const date = value.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return "";
+  return date.replaceAll("-", "/");
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
 }
 
 function formatMoney(value: number) {

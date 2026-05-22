@@ -18,11 +18,17 @@ type GoogleTokenClient = {
   requestAccessToken: (input?: { prompt?: string }) => void;
 };
 
+type GoogleErrorResponse = {
+  message?: string;
+  type?: string;
+};
+
 type GoogleAccounts = {
   oauth2: {
     initTokenClient: (input: {
       callback: (response: GoogleTokenResponse) => void;
       client_id: string;
+      error_callback?: (response: GoogleErrorResponse) => void;
       scope: string;
     }) => GoogleTokenClient;
   };
@@ -97,15 +103,37 @@ export async function requestGoogleAccessTokenWeb(input: { prompt?: string } = {
   }
 
   return new Promise<string>((resolve, reject) => {
+    let settled = false;
+    const timeout = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(
+        new Error(
+          "Google sign-in did not finish. Check whether the popup/passkey prompt is blocked, then try again.",
+        ),
+      );
+    }, 120_000);
+
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      callback();
+    };
+
     const client = oauth2.initTokenClient({
       callback: (response) => {
-        if (response.error || !response.access_token) {
-          reject(new Error(formatGoogleOAuthError(response)));
+        const accessToken = response.access_token;
+        if (response.error || !accessToken) {
+          finish(() => reject(new Error(formatGoogleOAuthError(response))));
           return;
         }
-        resolve(response.access_token);
+        finish(() => resolve(accessToken));
       },
       client_id: clientId,
+      error_callback: (response) => {
+        finish(() => reject(new Error(formatGooglePopupError(response))));
+      },
       scope: "openid email profile",
     });
     client.requestAccessToken({ prompt: input.prompt ?? "consent" });
@@ -235,4 +263,16 @@ function formatGoogleOAuthError(response: GoogleTokenResponse) {
   }
 
   return raw || "Google sign-in did not return an access token.";
+}
+
+function formatGooglePopupError(response: GoogleErrorResponse) {
+  const type = response.type ?? "unknown_error";
+  const message = response.message ? `: ${response.message}` : "";
+  if (type === "popup_failed_to_open") {
+    return "Google sign-in popup was blocked. Allow popups for this site and try again.";
+  }
+  if (type === "popup_closed") {
+    return "Google sign-in popup was closed before login finished.";
+  }
+  return `Google sign-in failed (${type}${message}).`;
 }

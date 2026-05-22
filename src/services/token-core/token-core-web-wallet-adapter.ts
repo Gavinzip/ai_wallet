@@ -1,3 +1,4 @@
+import { appendWalletActivityRecord } from "@/services/activity/wallet-activity-log";
 import {
   getAgentApiBaseUrl,
   getGoogleAccessTokenForServer,
@@ -85,6 +86,13 @@ export class WebTokenCoreWasmAdapter {
     if (cloudBackup) {
       const wallet = await restoreParsedWebTokenCoreWalletBackup(cloudBackup, user.sub);
       lastWalletSyncNotice = "Google backup found. Restored the same Token Core wallet for this Google account.";
+      appendWalletActivityRecord({
+        detail: `Restored ${shortAddress(wallet.address)} from encrypted Google wallet backup.`,
+        kind: "wallet_restored",
+        source: "wallet",
+        status: "restored",
+        title: "Google wallet backup restored",
+      });
       return wallet;
     }
 
@@ -121,8 +129,22 @@ export class WebTokenCoreWasmAdapter {
     try {
       await uploadStoredWebTokenCoreCloudBackup(stored, accessToken, user);
       lastWalletSyncNotice = "New Token Core wallet created and encrypted Google backup saved. This Google account can restore the same wallet on this domain.";
+      appendWalletActivityRecord({
+        detail: `Created ${shortAddress(stored.address)} and saved encrypted Google wallet backup.`,
+        kind: "wallet_created",
+        source: "wallet",
+        status: "created",
+        title: "Google Passkey wallet created",
+      });
     } catch (error) {
       lastWalletSyncNotice = `New Token Core wallet created locally, but Google backup upload failed: ${formatErrorMessage(error)}. Use Save Google Backup before relying on browser storage.`;
+      appendWalletActivityRecord({
+        detail: `Created ${shortAddress(stored.address)} locally. Google wallet backup upload failed.`,
+        kind: "wallet_created",
+        source: "wallet",
+        status: "created",
+        title: "Google Passkey wallet created locally",
+      });
     }
     return toTokenCoreAgentWallet(stored);
   }
@@ -225,7 +247,15 @@ export async function restoreWebTokenCoreCloudBackup(): Promise<TokenCoreAgentWa
   if (!backup) {
     throw new Error("No Google wallet backup exists for this account yet.");
   }
-  return restoreParsedWebTokenCoreWalletBackup(backup, user.sub);
+  const wallet = await restoreParsedWebTokenCoreWalletBackup(backup, user.sub);
+  appendWalletActivityRecord({
+    detail: `Restored ${shortAddress(wallet.address)} from encrypted Google wallet backup.`,
+    kind: "wallet_restored",
+    source: "wallet",
+    status: "restored",
+    title: "Google wallet backup restored",
+  });
+  return wallet;
 }
 
 export async function exportWebTokenCoreRecoveryPhrase() {
@@ -299,6 +329,13 @@ async function uploadStoredWebTokenCoreCloudBackup(
   if (!response.ok) {
     throw new Error(payload.error ?? `Google wallet backup upload failed with HTTP ${response.status}.`);
   }
+  appendWalletActivityRecord({
+    detail: `Saved encrypted backup for ${shortAddress(wallet.address)}. Server cannot decrypt it.`,
+    kind: "wallet_backup",
+    source: "wallet",
+    status: "saved",
+    title: "Google wallet backup saved",
+  });
   return payload;
 }
 
@@ -483,4 +520,9 @@ function toTokenCoreAgentWallet(wallet: StoredWebWallet): TokenCoreAgentWallet {
 
 function formatErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function shortAddress(value: string) {
+  if (value.length <= 12) return value;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
 }
